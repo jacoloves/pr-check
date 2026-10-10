@@ -1,0 +1,15 @@
+# pr-check 設定ファイル
+
+# PRの作成者。"@me" なら gh にログイン中のユーザー。
+# 他の人のPRを見たい場合は GitHub のログイン名を書く。
+# 省略時は "@me"。
+author: "@me"
+
+# 確認対象のリポジトリ("owner/repo" 形式)。1つ以上必須。
+repositories:
+  - jacoloves/jiyucho
+  # - stanby-inc/other-repo
+
+# 「要対応」に数えないユーザーのログイン名(botなど)。省略可。
+exclude_users: []
+# - some-bot

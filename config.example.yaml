@@ -1,0 +1,25 @@
+# pr-check 設定ファイルのサンプル
+#
+# このファイルをコピーして使う:
+#   cp config.example.yaml config.yaml                        # カレントディレクトリ用
+#   mkdir -p ~/.config/pr-check
+#   cp config.example.yaml ~/.config/pr-check/config.yaml     # どこからでも使う用
+#
+# 探索順序(-config を省略した場合):
+#   1. ./config.yaml
+#   2. $XDG_CONFIG_HOME/pr-check/config.yaml
+#   3. ~/.config/pr-check/config.yaml
+
+# PRの作成者。"@me" なら gh にログイン中のユーザー。
+# 他の人のPRを見たい場合は GitHub のログイン名を書く。
+# 省略時は "@me"。
+author: "@me"
+
+# 確認対象のリポジトリ("owner/repo" 形式)。1つ以上必須。
+repositories:
+  - owner/repo
+  # - owner/other-repo
+
+# 「要対応」に数えないユーザーのログイン名(botなど)。省略可。
+exclude_users: []
+# - some-bot

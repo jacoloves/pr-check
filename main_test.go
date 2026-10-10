@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -285,5 +286,127 @@ func TestCollectRunnerError(t *testing.T) {
 
 	if _, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me"); err == nil {
 		t.Fatal("gh が失敗したのに Collect() が nil を返しました")
+	}
+}
+
+// ---------------------------------------------------------------
+// 設定ファイルの探索
+// ---------------------------------------------------------------
+
+// ConfigCandidates の表駆動テスト。
+// 環境変数は getenv を差し替えて注入するので、実環境に依存しない。
+func TestConfigCandidates(t *testing.T) {
+	tests := []struct {
+		name string
+		xdg  string
+		home string
+		want []string
+	}{
+		{
+			name: "XDG未設定ならカレントとホームの2件",
+			xdg:  "",
+			home: "/home/u",
+			want: []string{"config.yaml", "/home/u/.config/pr-check/config.yaml"},
+		},
+		{
+			name: "XDG設定ありならカレント・XDG・ホームの順",
+			xdg:  "/x",
+			home: "/home/u",
+			want: []string{
+				"config.yaml",
+				"/x/pr-check/config.yaml",
+				"/home/u/.config/pr-check/config.yaml",
+			},
+		},
+		{
+			name: "XDGがホームの.configと同じなら重複を除く",
+			xdg:  "/home/u/.config",
+			home: "/home/u",
+			want: []string{"config.yaml", "/home/u/.config/pr-check/config.yaml"},
+		},
+		{
+			name: "ホーム不明ならホーム配下の候補を含まない",
+			xdg:  "",
+			home: "",
+			want: []string{"config.yaml"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getenv := func(key string) string {
+				if key == "XDG_CONFIG_HOME" {
+					return tt.xdg
+				}
+				return ""
+			}
+			got := ConfigCandidates(getenv, tt.home)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ConfigCandidates() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// ResolveConfigPath の正常系。
+func TestResolveConfigPath(t *testing.T) {
+	candidates := []string{"config.yaml", "/x/pr-check/config.yaml", "/home/u/.config/pr-check/config.yaml"}
+
+	tests := []struct {
+		name     string
+		explicit string
+		existing []string
+		want     string
+	}{
+		{"明示指定があり存在する", "/my/c.yaml", []string{"/my/c.yaml", "config.yaml"}, "/my/c.yaml"},
+		{"カレントに存在すれば最優先", "", []string{"config.yaml", "/home/u/.config/pr-check/config.yaml"}, "config.yaml"},
+		{"カレントに無くXDGにあればXDG", "", []string{"/x/pr-check/config.yaml", "/home/u/.config/pr-check/config.yaml"}, "/x/pr-check/config.yaml"},
+		{"ホームの.configのみ存在", "", []string{"/home/u/.config/pr-check/config.yaml"}, "/home/u/.config/pr-check/config.yaml"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := map[string]bool{}
+			for _, p := range tt.existing {
+				set[p] = true
+			}
+			exists := func(p string) bool { return set[p] }
+
+			got, err := ResolveConfigPath(tt.explicit, candidates, exists)
+			if err != nil {
+				t.Fatalf("ResolveConfigPath() が予期せず失敗しました: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ResolveConfigPath() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// 明示指定したファイルが無い場合は、他の候補があってもフォールバックせずエラーにする。
+func TestResolveConfigPathExplicitMissing(t *testing.T) {
+	candidates := []string{"config.yaml"}
+	exists := func(p string) bool { return p == "config.yaml" }
+
+	_, err := ResolveConfigPath("/typo/c.yaml", candidates, exists)
+	if err == nil {
+		t.Fatal("明示指定のファイルが無いのにエラーになりませんでした(フォールバックしてはいけません)")
+	}
+	if !strings.Contains(err.Error(), "/typo/c.yaml") {
+		t.Errorf("エラーに指定されたパスが含まれていません: %v", err)
+	}
+}
+
+// どこにも無い場合は、探索した全パスをエラーに列挙する。
+func TestResolveConfigPathNotFound(t *testing.T) {
+	candidates := []string{"config.yaml", "/x/pr-check/config.yaml"}
+	exists := func(string) bool { return false }
+
+	_, err := ResolveConfigPath("", candidates, exists)
+	if err == nil {
+		t.Fatal("設定ファイルがどこにも無いのにエラーになりませんでした")
+	}
+	for _, c := range candidates {
+		if !strings.Contains(err.Error(), c) {
+			t.Errorf("エラーに探索パス %q が含まれていません: %v", c, err)
+		}
 	}
 }

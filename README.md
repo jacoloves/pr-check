@@ -43,7 +43,17 @@ go build -o pr-check .
 
 ## 設定ファイル
 
-カレントディレクトリの `config.yaml` を読み込みます（`-config` で変更可能）。
+`-config` を省略した場合、次の順で探索し、**最初に見つかったもの**を使います。
+
+| 優先 | パス | 備考 |
+|------|------|------|
+| 1 | `./config.yaml` | カレントディレクトリ |
+| 2 | `$XDG_CONFIG_HOME/pr-check/config.yaml` | `XDG_CONFIG_HOME` が設定されている場合のみ |
+| 3 | `~/.config/pr-check/config.yaml` | ホームディレクトリが判明している場合のみ |
+
+どれも見つからない場合はエラーになります。
+`-config` で明示したパスが存在しない場合も、他の場所は探索せずエラーになります。
+使用した設定ファイルは、起動時に標準エラー出力へ `設定ファイル: <パス>` と表示されます。
 
 ```yaml
 # PRの作成者。"@me" なら gh にログイン中のユーザー。省略時は "@me"。
@@ -70,8 +80,11 @@ exclude_users: []
 ## 使い方
 
 ```sh
-# カレントディレクトリの config.yaml を使う
+# 探索順(カレントディレクトリ → XDG_CONFIG_HOME → ~/.config)で見つかった設定ファイルを使う
 ./pr-check
+
+# どのディレクトリからでも実行できる(~/.config/pr-check/config.yaml を使用)
+cd /tmp && /path/to/pr-check
 
 # 設定ファイルを指定する
 ./pr-check -config /path/to/config.yaml
@@ -95,13 +108,15 @@ go test ./...
 |----------|------|
 | `main.go` | 設定の読み込み、要対応の判定、`gh` 経由の情報収集、表示 |
 | `main_test.go` | 単体テスト |
-| `config.yaml` | 設定ファイル |
+| `config.yaml` | 設定ファイル(置き場所は「設定ファイル」の探索順を参照) |
 | `pr-check-architecture.md` | 設計ドキュメント |
 
 ## トラブルシューティング
 
 | 症状 | 原因と対処 |
 |------|-----------|
-| `設定ファイル ... を読み込めません` | `-config` のパスか、カレントディレクトリに `config.yaml` があるか確認してください。 |
+| `設定ファイル ... を読み込めません` | `-config` のパスか、設定ファイルの探索先(`./config.yaml`、`$XDG_CONFIG_HOME/pr-check/config.yaml`、`~/.config/pr-check/config.yaml`)に `config.yaml` があるか確認してください。 |
+| `設定ファイル ... が見つかりません` | 探索先のいずれにも `config.yaml` がありません。`~/.config/pr-check/config.yaml` に配置するか、`-config` で指定してください。 |
+| 古いバイナリで `open config.yaml: no such file or directory` | 探索機能を含まない古いバイナリです。`go build -o pr-check .` で再ビルドしてください。 |
 | `gh ... の実行に失敗しました` | `gh` が未インストール、未ログイン、または対象リポジトリへの権限がありません。`gh auth status` を確認してください。 |
 | `JSON のパースに失敗しました` | `gh` の出力形式が想定と異なります。`gh` を最新版に更新してください。 |

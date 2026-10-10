@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -38,7 +39,7 @@ func ParseConfig(path string) (*Config, error) {
 	var cfg Config
 
 	dec := yaml.NewDecoder(strings.NewReader(path))
-	// 未知のキーをエラーにして、タイプミス(repositorys 等)を検知する。
+	// 未知のキーをエラーにして、タイプミス(repositories 等)を検知する。
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -80,6 +81,73 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// ---------------------------------------------------------------
+// 設定ファイルの探索
+// ---------------------------------------------------------------
+
+// ConfigCandidates は -config 未指定時に探索するパスを、優先順に返す。
+//
+//  1. ./config.yaml                              (カレントディレクトリ)
+//  2. $XDG_CONFIG_HOME/pr-check/config.yaml      (XDG_CONFIG_HOME が設定されている場合のみ)
+//  3. ~/.config/pr-check/config.yaml             (ホームが判明している場合のみ)
+//
+// 環境変数とホームディレクトリは引数で受け取る。実環境に依存せずテストできるようにするため。
+func ConfigCandidates(getenv func(string) string, homeDir string) []string {
+	candidates := []string{"config.yaml"}
+
+	// 同じパスが2回入らないようにする(例: XDG_CONFIG_HOME=~/.config のとき)。
+	add := func(p string) {
+		for _, c := range candidates {
+			if c == p {
+				return
+			}
+		}
+		candidates = append(candidates, p)
+	}
+
+	if xdg := getenv("XDG_CONFIG_HOME"); xdg != "" {
+		add(filepath.Join(xdg, "pr-check", "config.yaml"))
+	}
+	if homeDir != "" {
+		add(filepath.Join(homeDir, ".config", "pr-check", "config.yaml"))
+	}
+	return candidates
+}
+
+// ResolveConfigPath は使用する設定ファイルのパスを決める。
+//
+//   - explicit が空でない場合: そのパスだけを確認する。存在しなくても他の候補には
+//     フォールバックしない(タイプミスに気づけなくなるため)。
+//   - explicit が空の場合: candidates を順に確認し、最初に存在するものを返す。
+//
+// exists はファイルの存在確認関数。テストでは偽物に差し替える。
+func ResolveConfigPath(explicit string, candidates []string, exists func(string) bool) (string, error) {
+	if explicit != "" {
+		if !exists(explicit) {
+			return "", fmt.Errorf(
+				"-config で指定された設定ファイル %q が見つかりません。パスを確認してください(指定時は他の場所を探索しません)",
+				explicit)
+		}
+		return explicit, nil
+	}
+
+	for _, c := range candidates {
+		if exists(c) {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"設定ファイルが見つかりません。次の場所を探しました:\n  %s\n"+
+			"config.example.yaml をコピーして上記のいずれかに配置するか、-config でパスを指定してください",
+		strings.Join(candidates, "\n "))
+}
+
+// fileExists は path が通常のファイル(ディレクトリでない)として存在するかを返す。
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // ---------------------------------------------------------------
@@ -287,10 +355,22 @@ func main() {
 }
 
 func run() error {
-	configPath := flag.String("config", "config.yaml", "設定ファイル(YAML)のパス")
+	// 既定値を "" にして「明示指定」と「未指定(探索する)」を区別する。
+	configFlag := flag.String("config", "", "設定ファイル(YAML)のパス。省略時は ./config.yaml → $XDG_CONFIG_HOME/pr-check/config.yaml → ~/.config/pr-check/config.yaml の順に探索")
 	flag.Parse()
 
-	cfg, err := LoadConfig(*configPath)
+	// ホームが取得できなくても致命的ではない(その場合はホーム配下の候補を除外するだけ)。
+	home, _ := os.UserHomeDir()
+	configPath, err := ResolveConfigPath(*configFlag, ConfigCandidates(os.Getenv, home), fileExists)
+	if err != nil {
+		return err
+	}
+
+	// どの設定ファイルが使われたかを標準エラー出力に表示する。
+	// 標準出力(PR一覧)を汚さないので、パイプやリダイレクトに影響しない。
+	fmt.Fprintf(os.Stderr, "設定ファイル: %s\n", configPath)
+
+	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		return err
 	}

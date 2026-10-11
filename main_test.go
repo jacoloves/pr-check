@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
-	"text/tabwriter"
 	"time"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // mustTime は RFC3339 文字列を time.Time に変換する。テスト用の補助関数。
@@ -435,13 +437,14 @@ func testSummary(repo string, num int, title, decision string, pending int) Summ
 // TestRenderGolden は ASCII のみの入力に対して、出力を完全一致で確認する。
 func TestRenderGolden(t *testing.T) {
 	var buf bytes.Buffer
-	err := Render(&buf, []Summary{testSummary("a/b", 8, "fix", "NONE", 1)})
+	err := Render(&buf, []Summary{testSummary("a/b", 8, "fix", "NONE", 1)}, NewPainter(false))
 	if err != nil {
 		t.Fatalf("Render がエラーを返しました: %v", err)
 	}
 
+	// ヘッダは全角なので、幅は表示幅(全角=2)で揃う。
 	want := "リポジトリ  PR  タイトル  レビュー  要対応  最終更新\n" +
-		"a/b    8   fix   NONE  1    2026-08-19 12:52\n"
+		"a/b         8   fix       NONE      1       2026-08-19 12:52\n"
 	if got := buf.String(); got != want {
 		t.Errorf("出力が一致しません。\n got: %q\nwant: %q", got, want)
 	}
@@ -450,7 +453,7 @@ func TestRenderGolden(t *testing.T) {
 // TestRenderEmpty は0件のとき、ヘッダ行だけが出力されることを確認する。
 func TestRenderEmpty(t *testing.T) {
 	var buf bytes.Buffer
-	if err := Render(&buf, nil); err != nil {
+	if err := Render(&buf, nil, NewPainter(false)); err != nil {
 		t.Fatalf("Render がエラーを返しました: %v", err)
 	}
 	want := "リポジトリ  PR  タイトル  レビュー  要対応  最終更新\n"
@@ -459,33 +462,40 @@ func TestRenderEmpty(t *testing.T) {
 	}
 }
 
-// TestRenderMatchesTabwriter は、従来の tabwriter 実装と出力が完全に同じことを確認する。
-// 日本語タイトルや長さの異なる行を混ぜ、「見た目が変わっていない」ことを保証する回帰テスト。
-func TestRenderMatchesTabwriter(t *testing.T) {
+// TestRenderAlignsByDisplayWidth は、全角文字(幅2)を含んでも、
+// 最終列の開始位置が全行で同じ表示幅になること(=端末で列が揃うこと)を確認する。
+// 従来は tabwriter(文字数で桁を数える)と一致することを検証していたが、
+// 全角対応により意図的に仕様が変わったため、表示幅で検証する。
+func TestRenderAlignsByDisplayWidth(t *testing.T) {
 	summaries := []Summary{
 		testSummary("jacoloves/jiyucho", 8, "search: ワークスペース横断検索を追加する", "NONE", 1),
 		testSummary("jacoloves/pr-check", 123, "feat: config discovery", "APPROVED", 0),
 		testSummary("x/y", 2, "短い", "CHANGES_REQUESTED", 12),
 	}
 
-	// 期待値: 従来の run() と同じ書き方で tabwriter に書かせる。
-	var want bytes.Buffer
-	w := tabwriter.NewWriter(&want, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "リポジトリ\tPR\tタイトル\tレビュー\t要対応\t最終更新")
-	for _, s := range summaries {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%s\n",
-			s.Repo, s.Number, s.Title, s.ReviewDecision, s.Pending, s.UpdatedAt.Local().Format("2006-01-02 15:04"))
-	}
-	if err := w.Flush(); err != nil {
-		t.Fatalf("tabwriter の Flush に失敗しました: %v", err)
-	}
-
 	var got bytes.Buffer
-	if err := Render(&got, summaries); err != nil {
+	if err := Render(&got, summaries, NewPainter(false)); err != nil {
 		t.Fatalf("Render がエラーを返しました: %v", err)
 	}
-	if got.String() != want.String() {
-		t.Errorf("tabwriter の出力と一致しません。\n got:\n%s\nwant:\n%s", got.String(), want.String())
+
+	lines := strings.Split(strings.TrimSuffix(got.String(), "\n"), "\n")
+	if len(lines) != len(summaries)+1 {
+		t.Fatalf("行数が想定と違います: got %d, want %d", len(lines), len(summaries)+1)
+	}
+
+	// 最終列(ヘッダは「最終更新」、本文は日付)より前の表示幅が全行で等しいはず。
+	lastCols := []string{"最終更新", "2026-08-19 12:52", "2026-08-19 12:52", "2026-08-19 12:52"}
+	wantWidth := -1
+	for i, line := range lines {
+		if !strings.HasSuffix(line, lastCols[i]) {
+			t.Fatalf("%d 行目が最終列 %q で終わっていません: %q", i, lastCols[i], line)
+		}
+		w := runewidth.StringWidth(strings.TrimSuffix(line, lastCols[i]))
+		if wantWidth < 0 {
+			wantWidth = w
+		} else if w != wantWidth {
+			t.Errorf("%d 行目の最終列の開始位置が揃っていません: got %d, want %d\n%s", i, w, wantWidth, got.String())
+		}
 	}
 }
 
@@ -498,7 +508,7 @@ func (failWriter) Write(p []byte) (int, error) {
 
 // TestRenderWriteError は書き込み失敗がエラーとして返ることを確認する。
 func TestRenderWriteError(t *testing.T) {
-	err := Render(failWriter{}, []Summary{testSummary("a/b", 1, "t", "NONE", 0)})
+	err := Render(failWriter{}, []Summary{testSummary("a/b", 1, "t", "NONE", 0)}, NewPainter(false))
 	if err == nil {
 		t.Fatal("書き込み失敗なのにエラーが返りませんでした")
 	}
@@ -653,5 +663,147 @@ func TestSortSummariesStable(t *testing.T) {
 	SortSummaries(in, SortPending, true)
 	if got := ids(in); !reflect.DeepEqual(got, want) {
 		t.Errorf("reverse でも同点は元の順序を保つべきです。\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------
+// 色付け
+// ---------------------------------------------------------------
+
+func TestPainter(t *testing.T) {
+	on := NewPainter(true)
+	off := NewPainter(false)
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"Bold", on.Bold("x"), "\x1b[1mx\x1b[0m"},
+		{"Faint", on.Faint("x"), "\x1b[2mx\x1b[0m"},
+		{"Red", on.Red("x"), "\x1b[31mx\x1b[0m"},
+		{"Green", on.Green("x"), "\x1b[32mx\x1b[0m"},
+		{"Yellow", on.Yellow("x"), "\x1b[33mx\x1b[0m"},
+		{"BoldYellow", on.BoldYellow("x"), "\x1b[1;33mx\x1b[0m"},
+		// 無効なときは全て恒等変換(何も付けない)。
+		{"off Bold", off.Bold("x"), "x"},
+		{"off Red", off.Red("x"), "x"},
+		{"off BoldYellow", off.BoldYellow("x"), "x"},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
+func TestShouldColor(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	tests := []struct {
+		name  string
+		mode  string
+		env   map[string]string
+		isTTY bool
+		want  bool
+	}{
+		{"auto: 端末なら色あり", "auto", map[string]string{"TERM": "xterm"}, true, true},
+		{"auto: NO_COLOR があれば色なし", "auto", map[string]string{"TERM": "xterm", "NO_COLOR": "1"}, true, false},
+		{"auto: NO_COLOR が空なら無視", "auto", map[string]string{"TERM": "xterm", "NO_COLOR": ""}, true, true},
+		{"auto: TERM=dumb なら色なし", "auto", map[string]string{"TERM": "dumb"}, true, false},
+		{"auto: 端末でなければ色なし", "auto", map[string]string{"TERM": "xterm"}, false, false},
+		{"always: 全てを無視して色あり", "always", map[string]string{"NO_COLOR": "1", "TERM": "dumb"}, false, true},
+		{"never: 端末でも色なし", "never", map[string]string{"TERM": "xterm"}, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ShouldColor(tt.mode, env(tt.env), tt.isTTY)
+			if err != nil {
+				t.Fatalf("予期せぬエラー: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldColorError(t *testing.T) {
+	_, err := ShouldColor("rainbow", func(string) string { return "" }, true)
+	if err == nil {
+		t.Fatal("不正な mode なのにエラーが返りませんでした")
+	}
+	for _, want := range []string{"rainbow", "auto", "always", "never"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("エラーに %q が含まれていません: %v", want, err)
+		}
+	}
+}
+
+// colorFixture は色付けのテストで使う入力。判定4種と、要対応 0 / 1 / 12 を含む。
+func colorFixture() []Summary {
+	return []Summary{
+		testSummary("a/b", 8, "fix", "APPROVED", 0),
+		testSummary("c/dd", 1, "ドキュメント修正", "CHANGES_REQUESTED", 12),
+		testSummary("e/f", 2, "u", "REVIEW_REQUIRED", 1),
+		testSummary("g/h", 3, "v", "NONE", 0),
+	}
+}
+
+// ansiPattern は SGR(色・装飾)のエスケープシーケンスにマッチする。
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// TestRenderNoColorHasNoEscape は、色無効のとき ANSI が一切出ないことを確認する。
+func TestRenderNoColorHasNoEscape(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Render(&buf, colorFixture(), NewPainter(false)); err != nil {
+		t.Fatalf("Render がエラーを返しました: %v", err)
+	}
+	if strings.Contains(buf.String(), "\x1b") {
+		t.Errorf("色無効なのにエスケープが含まれています: %q", buf.String())
+	}
+}
+
+// TestRenderColorKeepsLayout は、色有効の出力から ANSI を取り除くと、
+// 色無効の出力と完全に一致すること(=列がずれないこと)を確認する。最も重要な回帰テスト。
+func TestRenderColorKeepsLayout(t *testing.T) {
+	var plain, colored bytes.Buffer
+	if err := Render(&plain, colorFixture(), NewPainter(false)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Render(&colored, colorFixture(), NewPainter(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	stripped := ansiPattern.ReplaceAllString(colored.String(), "")
+	if stripped != plain.String() {
+		t.Errorf("ANSI を除去しても色なしの出力と一致しません。\n stripped:\n%s\n plain:\n%s", stripped, plain.String())
+	}
+}
+
+// TestRenderColorStyles は、どのセルにどの色が付くかを確認する。
+func TestRenderColorStyles(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Render(&buf, colorFixture(), NewPainter(true)); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	wants := []string{
+		"\x1b[1mPR\x1b[0m",                 // ヘッダは太字
+		"\x1b[32mAPPROVED\x1b[0m",          // 承認は緑
+		"\x1b[31mCHANGES_REQUESTED\x1b[0m", // 変更要求は赤
+		"\x1b[33mREVIEW_REQUIRED\x1b[0m",   // レビュー待ちは黄
+		"\x1b[2mNONE\x1b[0m",               // NONE は暗色
+		"\x1b[2m0\x1b[0m",                  // 要対応 0 は暗色
+		"\x1b[1;33m1\x1b[0m",               // 要対応 1 は太字の黄
+		"\x1b[1;33m12\x1b[0m",              // 要対応 12 も太字の黄
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("出力に %q が含まれていません。\n%s", w, out)
+		}
 	}
 }

@@ -17,8 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/mattn/go-runewidth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -347,47 +347,149 @@ func Collect(run Runner, repo string, cfg *Config, self string) ([]Summary, erro
 }
 
 // ---------------------------------------------------------------
+// 色付け
+// ---------------------------------------------------------------
+
+// Painter は文字列に ANSI の装飾を付ける。enabled が false のときは何も付けない
+// (全メソッドが恒等変換になる)ので、呼び出し側は色の有無を意識しなくてよい。
+type Painter struct {
+	enabled bool
+}
+
+// NewPainter は色の有効/無効を指定して Painter を作る。
+func NewPainter(enabled bool) Painter {
+	return Painter{enabled: enabled}
+}
+
+// wrap は SGR コード code を s の前に付け、後ろでリセットする。
+func (p Painter) wrap(code, s string) string {
+	if !p.enabled {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+
+func (p Painter) Bold(s string) string       { return p.wrap("1", s) }
+func (p Painter) Faint(s string) string      { return p.wrap("2", s) }
+func (p Painter) Red(s string) string        { return p.wrap("31", s) }
+func (p Painter) Green(s string) string      { return p.wrap("32", s) }
+func (p Painter) Yellow(s string) string     { return p.wrap("33", s) }
+func (p Painter) BoldYellow(s string) string { return p.wrap("1;33", s) }
+
+// ShouldColor は --color の mode ("auto" / "always" / "never") から、
+// 実際に色を付けるかを決める。環境変数と端末かどうかは引数で受け取る
+// (実環境に依存せずテストするため)。
+func ShouldColor(mode string, getenv func(string) string, isTTY bool) (bool, error) {
+	switch mode {
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	case "auto":
+		// NO_COLOR は「空でなければ無効」という慣習(https://no-color.org)。
+		if getenv("NO_COLOR") != "" {
+			return false, nil
+		}
+		if getenv("TERM") == "dumb" {
+			return false, nil
+		}
+		return isTTY, nil
+	default:
+		return false, fmt.Errorf("--color の値 %q は指定できません。auto, always, never のいずれかを指定してください", mode)
+	}
+}
+
+// isTerminal は f が端末(文字デバイス)かどうかを返す。
+// パイプやファイルへのリダイレクト時は false になる。
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// ---------------------------------------------------------------
 // 描画
 // ---------------------------------------------------------------
 
 // columnGap は列と列の間に空ける空白の数。従来の tabwriter の padding=2 と同じ。
 const columnGap = 2
 
-// tableHeader は表のヘッダ行。
-var tableHeader = []string{"リポジトリ", "PR", "タイトル", "レビュー", "要対応", "最終更新"}
+// cell は表の1マス。text は素の文字列、style は表示時に text へ掛ける装飾。
+// 列幅は style を掛ける前の text で計算する(ANSI で列がずれないようにするため)。
+type cell struct {
+	text  string
+	style func(string) string
+}
 
-// summaryRow は1PR分の Summary を、表の1行分のセル(文字列)に変換する。
-// 色付けやソートの前段にあたる「見た目に使う文字列」を作るだけで、副作用はない。
-func summaryRow(s Summary) []string {
-	return []string{
-		s.Repo,
-		strconv.Itoa(s.Number),
-		s.Title,
-		s.ReviewDecision,
-		strconv.Itoa(s.Pending),
-		s.UpdatedAt.Local().Format("2006-01-02 15:04"),
+// cellWidth は s を端末に表示したときの桁数を返す。全角文字は2桁、半角は1桁。
+func cellWidth(s string) int { return runewidth.StringWidth(s) }
+
+// plain は装飾を付けない style。
+func plain(s string) string { return s }
+
+// headerCells は表のヘッダ行のセルを返す。ヘッダは全て太字。
+func headerCells(p Painter) []cell {
+	names := []string{"リポジトリ", "PR", "タイトル", "レビュー", "要対応", "最終更新"}
+	cells := make([]cell, len(names))
+	for i, n := range names {
+		cells[i] = cell{n, p.Bold}
+	}
+	return cells
+}
+
+// decisionStyle はレビュー判定に応じた装飾を返す。未知の値は装飾なし。
+func decisionStyle(p Painter, decision string) func(string) string {
+	switch decision {
+	case "APPROVED":
+		return p.Green
+	case "CHANGES_REQUESTED":
+		return p.Red
+	case "REVIEW_REQUIRED":
+		return p.Yellow
+	case "NONE":
+		return p.Faint
+	default:
+		return plain
+	}
+}
+
+// pendingStyle は要対応件数に応じた装飾を返す。1件以上は目立たせ、0件は控えめにする。
+func pendingStyle(p Painter, n int) func(string) string {
+	if n > 0 {
+		return p.BoldYellow
+	}
+	return p.Faint
+}
+
+// summaryCells は1PR分の Summary を、表の1行分のセルに変換する。
+func summaryCells(s Summary, p Painter) []cell {
+	return []cell{
+		{s.Repo, plain},
+		{strconv.Itoa(s.Number), plain},
+		{s.Title, plain},
+		{s.ReviewDecision, decisionStyle(p, s.ReviewDecision)},
+		{strconv.Itoa(s.Pending), pendingStyle(p, s.Pending)},
+		{s.UpdatedAt.Local().Format("2006-01-02 15:04"), plain},
 	}
 }
 
 // Render は summaries をヘッダ付きの表として w に書き出す。
 //
-// 各列の幅を「その列で一番長いセルの文字数」に揃え、列間に columnGap 個の空白を入れる。
+// 各列の幅は「その列で一番長いセルの素の文字数」に揃え、列間に columnGap 個の空白を入れる。
+// 色は文字の部分だけに付け、パディングの空白には付けない。
 // 最終列には空白を詰めない(行末に余分な空白を残さない)。
-// 幅は rune 数で数える。従来の tabwriter と同じ数え方なので、見た目は変わらない。
-// (全角文字を2桁として数える対応は、このステップの対象外)
-func Render(w io.Writer, summaries []Summary) error {
-	// ヘッダ + データ行を、同じ []string の並びとして扱う。
-	rows := make([][]string, 0, len(summaries)+1)
-	rows = append(rows, tableHeader)
+// 幅は端末での表示幅で数える(全角文字は2桁、半角は1桁)。
+func Render(w io.Writer, summaries []Summary, p Painter) error {
+	rows := make([][]cell, 0, len(summaries)+1)
+	rows = append(rows, headerCells(p))
 	for _, s := range summaries {
-		rows = append(rows, summaryRow(s))
+		rows = append(rows, summaryCells(s, p))
 	}
 
-	// 列ごとの最大幅を求める。
-	widths := make([]int, len(tableHeader))
+	// 列ごとの最大幅を、装飾前の text で求める。
+	widths := make([]int, len(rows[0]))
 	for _, row := range rows {
-		for i, cell := range row {
-			if n := utf8.RuneCountInString(cell); n > widths[i] {
+		for i, c := range row {
+			if n := cellWidth(c.text); n > widths[i] {
 				widths[i] = n
 			}
 		}
@@ -395,21 +497,23 @@ func Render(w io.Writer, summaries []Summary) error {
 
 	for _, row := range rows {
 		var b strings.Builder
-		for i, cell := range row {
-			b.WriteString(cell)
+		for i, c := range row {
+			b.WriteString(c.style(c.text)) // 色は文字だけに付ける
 			if i == len(row)-1 {
-				break
+				break // 最終列は空白で埋めない
 			}
-			pad := widths[i] - utf8.RuneCountInString(cell) + columnGap
-			b.WriteString(strings.Repeat(" ", pad))
+			pad := widths[i] - cellWidth(c.text) + columnGap
+			b.WriteString(strings.Repeat(" ", pad)) // 空白は素の文字数で計算
 		}
 		b.WriteByte('\n')
 
 		if _, err := io.WriteString(w, b.String()); err != nil {
-			return fmt.Errorf("表の書き出しに失敗しました: %w (出力先がクローズされていないか、ディスク容量やパイプの状態を確認してください)", err)
+			return fmt.Errorf(
+				"表の書き出しに失敗しました: %w (出力先がクローズされていないか、ディスク容量やパイプの状態を確認してください)",
+				err,
+			)
 		}
 	}
-
 	return nil
 }
 
@@ -550,6 +654,7 @@ func run() error {
 	configFlag := flag.String("config", "", "設定ファイル(YAML)のパス。省略時は ./config.yaml → $XDG_CONFIG_HOME/pr-check/config.yaml → ~/.config/pr-check/config.yaml の順に探索")
 	sortFlag := flag.String("sort", "", "並べ替えの基準: pending(要対応が多い順) / updated(更新が新しい順) / review(レビュー緊急度順) / repo / number。省略時は設定ファイル順")
 	reverseFlag := flag.Bool("reverse", false, "並び順を反転する(--sort と併用)")
+	colorFlag := flag.String("color", "auto", "色付け: auto(端末のときだけ) / always / never。auto では NO_COLOR 環境変数も尊重する")
 	flag.Parse()
 
 	// 引数の誤りは、時間のかかる gh の呼び出しの前に検出する。
@@ -559,6 +664,10 @@ func run() error {
 	}
 	if *reverseFlag && sortKey == SortNone {
 		return fmt.Errorf("--reverse は --sort と一緒に指定してください(例: --sort updated --reverse)")
+	}
+	useColor, err := ShouldColor(*colorFlag, os.Getenv, isTerminal(os.Stdout))
+	if err != nil {
+		return err
 	}
 
 	// ホームが取得できなくても致命的ではない(その場合はホーム配下の候補を除外するだけ)。
@@ -599,5 +708,5 @@ func run() error {
 		all = append(all, summaries...)
 	}
 	SortSummaries(all, sortKey, *reverseFlag)
-	return Render(os.Stdout, all)
+	return Render(os.Stdout, all, NewPainter(useColor))
 }

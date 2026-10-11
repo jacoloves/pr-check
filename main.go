@@ -12,9 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -344,6 +345,73 @@ func Collect(run Runner, repo string, cfg *Config, self string) ([]Summary, erro
 }
 
 // ---------------------------------------------------------------
+// 描画
+// ---------------------------------------------------------------
+
+// columnGap は列と列の間に空ける空白の数。従来の tabwriter の padding=2 と同じ。
+const columnGap = 2
+
+// tableHeader は表のヘッダ行。
+var tableHeader = []string{"リポジトリ", "PR", "タイトル", "レビュー", "要対応", "最終更新"}
+
+// summaryRow は1PR分の Summary を、表の1行分のセル(文字列)に変換する。
+// 色付けやソートの前段にあたる「見た目に使う文字列」を作るだけで、副作用はない。
+func summaryRow(s Summary) []string {
+	return []string{
+		s.Repo,
+		strconv.Itoa(s.Number),
+		s.Title,
+		s.ReviewDecision,
+		strconv.Itoa(s.Pending),
+		s.UpdatedAt.Local().Format("2006-01-02 15:04"),
+	}
+}
+
+// Render は summaries をヘッダ付きの表として w に書き出す。
+//
+// 各列の幅を「その列で一番長いセルの文字数」に揃え、列間に columnGap 個の空白を入れる。
+// 最終列には空白を詰めない(行末に余分な空白を残さない)。
+// 幅は rune 数で数える。従来の tabwriter と同じ数え方なので、見た目は変わらない。
+// (全角文字を2桁として数える対応は、このステップの対象外)
+func Render(w io.Writer, summaries []Summary) error {
+	// ヘッダ + データ行を、同じ []string の並びとして扱う。
+	rows := make([][]string, 0, len(summaries)+1)
+	rows = append(rows, tableHeader)
+	for _, s := range summaries {
+		rows = append(rows, summaryRow(s))
+	}
+
+	// 列ごとの最大幅を求める。
+	widths := make([]int, len(tableHeader))
+	for _, row := range rows {
+		for i, cell := range row {
+			if n := utf8.RuneCountInString(cell); n > widths[i] {
+				widths[i] = n
+			}
+		}
+	}
+
+	for _, row := range rows {
+		var b strings.Builder
+		for i, cell := range row {
+			b.WriteString(cell)
+			if i == len(row)-1 {
+				break
+			}
+			pad := widths[i] - utf8.RuneCountInString(cell) + columnGap
+			b.WriteString(strings.Repeat(" ", pad))
+		}
+		b.WriteByte('\n')
+
+		if _, err := io.WriteString(w, b.String()); err != nil {
+			return fmt.Errorf("表の書き出しに失敗しました: %w (出力先がクローズされていないか、ディスク容量やパイプの状態を確認してください)", err)
+		}
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------
 
@@ -386,18 +454,15 @@ func run() error {
 		self = strings.TrimSpace(string(out))
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "リポジトリ\tPR\tタイトル\tレビュー\t要対応\t最終更新")
+	// 全リポジトリの結果を集約してから描画する。
+	// (後続のソートは「全件が揃っていること」が前提になるため)
+	var all []Summary
 	for _, repo := range cfg.Repositories {
 		summaries, err := Collect(ghRun, repo, cfg, self)
 		if err != nil {
 			return err
 		}
-		for _, s := range summaries {
-			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%s\n",
-				s.Repo, s.Number, s.Title, s.ReviewDecision, s.Pending,
-				s.UpdatedAt.Local().Format("2006-01-02 15:04"))
-		}
+		all = append(all, summaries...)
 	}
-	return w.Flush()
+	return Render(os.Stdout, all)
 }

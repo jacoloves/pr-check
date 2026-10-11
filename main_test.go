@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"text/tabwriter"
 	"time"
 )
 
@@ -408,5 +411,98 @@ func TestResolveConfigPathNotFound(t *testing.T) {
 		if !strings.Contains(err.Error(), c) {
 			t.Errorf("エラーに探索パス %q が含まれていません: %v", c, err)
 		}
+	}
+}
+
+// ---------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------
+
+// testSummary はテスト用の Summary を作る。
+// 時刻は time.Local で作る。Render は Local() に変換して表示するため、
+// 実行環境のタイムゾーンに関わらず期待値が "2026-08-19 12:52" で固定できる。
+func testSummary(repo string, num int, title, decision string, pending int) Summary {
+	return Summary{
+		Repo:           repo,
+		Number:         num,
+		Title:          title,
+		ReviewDecision: decision,
+		Pending:        pending,
+		UpdatedAt:      time.Date(2026, 8, 19, 12, 52, 0, 0, time.Local),
+	}
+}
+
+// TestRenderGolden は ASCII のみの入力に対して、出力を完全一致で確認する。
+func TestRenderGolden(t *testing.T) {
+	var buf bytes.Buffer
+	err := Render(&buf, []Summary{testSummary("a/b", 8, "fix", "NONE", 1)})
+	if err != nil {
+		t.Fatalf("Render がエラーを返しました: %v", err)
+	}
+
+	want := "リポジトリ  PR  タイトル  レビュー  要対応  最終更新\n" +
+		"a/b    8   fix   NONE  1    2026-08-19 12:52\n"
+	if got := buf.String(); got != want {
+		t.Errorf("出力が一致しません。\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestRenderEmpty は0件のとき、ヘッダ行だけが出力されることを確認する。
+func TestRenderEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Render(&buf, nil); err != nil {
+		t.Fatalf("Render がエラーを返しました: %v", err)
+	}
+	want := "リポジトリ  PR  タイトル  レビュー  要対応  最終更新\n"
+	if got := buf.String(); got != want {
+		t.Errorf("出力が一致しません。\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestRenderMatchesTabwriter は、従来の tabwriter 実装と出力が完全に同じことを確認する。
+// 日本語タイトルや長さの異なる行を混ぜ、「見た目が変わっていない」ことを保証する回帰テスト。
+func TestRenderMatchesTabwriter(t *testing.T) {
+	summaries := []Summary{
+		testSummary("jacoloves/jiyucho", 8, "search: ワークスペース横断検索を追加する", "NONE", 1),
+		testSummary("jacoloves/pr-check", 123, "feat: config discovery", "APPROVED", 0),
+		testSummary("x/y", 2, "短い", "CHANGES_REQUESTED", 12),
+	}
+
+	// 期待値: 従来の run() と同じ書き方で tabwriter に書かせる。
+	var want bytes.Buffer
+	w := tabwriter.NewWriter(&want, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "リポジトリ\tPR\tタイトル\tレビュー\t要対応\t最終更新")
+	for _, s := range summaries {
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%d\t%s\n",
+			s.Repo, s.Number, s.Title, s.ReviewDecision, s.Pending, s.UpdatedAt.Local().Format("2006-01-02 15:04"))
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("tabwriter の Flush に失敗しました: %v", err)
+	}
+
+	var got bytes.Buffer
+	if err := Render(&got, summaries); err != nil {
+		t.Fatalf("Render がエラーを返しました: %v", err)
+	}
+	if got.String() != want.String() {
+		t.Errorf("tabwriter の出力と一致しません。\n got:\n%s\nwant:\n%s", got.String(), want.String())
+	}
+}
+
+// failWriter は常に書き込みに失敗する io.Writer。
+type failWriter struct{}
+
+func (failWriter) Write(p []byte) (int, error) {
+	return 0, errors.New("書き込み失敗(テスト用)")
+}
+
+// TestRenderWriteError は書き込み失敗がエラーとして返ることを確認する。
+func TestRenderWriteError(t *testing.T) {
+	err := Render(failWriter{}, []Summary{testSummary("a/b", 1, "t", "NONE", 0)})
+	if err == nil {
+		t.Fatal("書き込み失敗なのにエラーが返りませんでした")
+	}
+	if !strings.Contains(err.Error(), "書き込み失敗") {
+		t.Errorf("エラーに原因が含まれていません: %v", err)
 	}
 }

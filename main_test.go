@@ -506,3 +506,152 @@ func TestRenderWriteError(t *testing.T) {
 		t.Errorf("エラーに原因が含まれていません: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------
+// ソート
+// ---------------------------------------------------------------
+
+// sortFixture はソートのテスト用に、(repo, number, 判定, 要対応, 更新日) を持つ Summary を作る。
+func sortFixture(repo string, num int, decision string, pending, day int) Summary {
+	return Summary{
+		Repo:           repo,
+		Number:         num,
+		ReviewDecision: decision,
+		Pending:        pending,
+		UpdatedAt:      time.Date(2026, 8, day, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+// sortInput はソートのテストで共通に使う入力。毎回新しく作り、テスト間で共有しない
+// (SortSummaries は引数のスライスを直接並べ替えるため)。
+func sortInput() []Summary {
+	return []Summary{
+		sortFixture("a/x", 3, "APPROVED", 0, 10),
+		sortFixture("a/x", 1, "CHANGES_REQUESTED", 2, 12),
+		sortFixture("b/y", 2, "REVIEW_REQUIRED", 2, 11),
+		sortFixture("b/y", 1, "NONE", 5, 13),
+		sortFixture("a/z", 7, "UNKNOWN", 1, 9),
+	}
+}
+
+// ids は並び順の確認用に "repo#number" の配列にする。
+func ids(ss []Summary) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = fmt.Sprintf("%s#%d", s.Repo, s.Number)
+	}
+	return out
+}
+
+func TestParseSortKey(t *testing.T) {
+	for _, in := range []string{"pending", "updated", "review", "repo", "number"} {
+		got, err := ParseSortKey(in)
+		if err != nil {
+			t.Errorf("ParseSortKey(%q) が予期せずエラー: %v", in, err)
+		}
+		if string(got) != in {
+			t.Errorf("ParseSortKey(%q) = %q, want %q", in, got, in)
+		}
+	}
+
+	// 空文字は「ソートしない」を表す。
+	got, err := ParseSortKey("")
+	if err != nil || got != SortNone {
+		t.Errorf("ParseSortKey(\"\") = (%q, %v), want (SortNone, nil)", got, err)
+	}
+}
+
+func TestParseSortKeyError(t *testing.T) {
+	_, err := ParseSortKey("foo")
+	if err == nil {
+		t.Fatal("不正なキーなのにエラーが返りませんでした")
+	}
+	// 入力値と、使えるキー一覧がメッセージに含まれること。
+	for _, want := range []string{"foo", "pending", "updated", "review", "repo", "number"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("エラーに %q が含まれていません: %v", want, err)
+		}
+	}
+}
+
+func TestSortSummaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     SortKey
+		reverse bool
+		want    []string
+	}{
+		{
+			name: "pending: 要対応が多い順、同数なら更新が新しい順",
+			key:  SortPending,
+			want: []string{"b/y#1", "a/x#1", "b/y#2", "a/z#7", "a/x#3"},
+		},
+		{
+			name: "updated: 更新が新しい順",
+			key:  SortUpdated,
+			want: []string{"b/y#1", "a/x#1", "b/y#2", "a/x#3", "a/z#7"},
+		},
+		{
+			name: "review: 緊急度順、未知の値は最後",
+			key:  SortReview,
+			want: []string{"a/x#1", "b/y#2", "b/y#1", "a/x#3", "a/z#7"},
+		},
+		{
+			name: "repo: リポジトリ昇順、同じなら番号昇順",
+			key:  SortRepo,
+			want: []string{"a/x#1", "a/x#3", "a/z#7", "b/y#1", "b/y#2"},
+		},
+		{
+			name: "number: 番号昇順、同じならリポジトリ昇順",
+			key:  SortNumber,
+			want: []string{"a/x#1", "b/y#1", "b/y#2", "a/x#3", "a/z#7"},
+		},
+		{
+			name:    "pending + reverse: 完全に逆順",
+			key:     SortPending,
+			reverse: true,
+			want:    []string{"a/x#3", "a/z#7", "b/y#2", "a/x#1", "b/y#1"},
+		},
+		{
+			name:    "updated + reverse: 更新が古い順",
+			key:     SortUpdated,
+			reverse: true,
+			want:    []string{"a/z#7", "a/x#3", "b/y#2", "a/x#1", "b/y#1"},
+		},
+		{
+			name: "キー無し: 入力順のまま",
+			key:  SortNone,
+			want: []string{"a/x#3", "a/x#1", "b/y#2", "b/y#1", "a/z#7"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := sortInput()
+			SortSummaries(in, tt.key, tt.reverse)
+			if got := ids(in); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("並び順が一致しません。\n got: %v\nwant: %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSortSummariesStable は、比較上まったく同点の要素が元の順序を保つことを確認する。
+// pending と updated が同じなら、pending ソートでは元の並びが維持されるはず。
+func TestSortSummariesStable(t *testing.T) {
+	in := []Summary{
+		sortFixture("b/y", 9, "None", 1, 5),
+		sortFixture("a/x", 9, "None", 1, 5),
+	}
+	SortSummaries(in, SortPending, false)
+	want := []string{"b/y#9", "a/x#9"}
+	if got := ids(in); !reflect.DeepEqual(got, want) {
+		t.Errorf("安定ソートになっていません。\n got: %v\nwant: %v", got, want)
+	}
+
+	// reverse でも完全同点の要素は元の順序を保つ(単純な逆順にはならない)。
+	SortSummaries(in, SortPending, true)
+	if got := ids(in); !reflect.DeepEqual(got, want) {
+		t.Errorf("reverse でも同点は元の順序を保つべきです。\n got: %v\nwant: %v", got, want)
+	}
+}

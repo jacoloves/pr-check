@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -412,6 +414,127 @@ func Render(w io.Writer, summaries []Summary) error {
 }
 
 // ---------------------------------------------------------------
+// ソート
+// ---------------------------------------------------------------
+
+// SortKey は --sort で指定できる並べ替えの基準。
+type SortKey string
+
+const (
+	// SortNone は並べ替えない(取得順=設定ファイル順のまま)。
+	SortNone    SortKey = ""
+	SortPending SortKey = "pending" // 要対応が多い順
+	SortUpdated SortKey = "updated" // 更新が新しい順
+	SortReview  SortKey = "review"  // レビューの緊急度順
+	SortRepo    SortKey = "repo"    // リポジトリ名の昇順
+	SortNumber  SortKey = "number"  // PR番号の昇順
+)
+
+// sortKeys は指定可能なキーの一覧。エラーメッセージの表示にも使う。
+var sortKeys = []SortKey{SortPending, SortUpdated, SortReview, SortRepo, SortNumber}
+
+// ParseSortKey は --sort の文字列を検証して SortKey に変換する。
+// 空文字は「ソートしない」を表す。
+func ParseSortKey(s string) (SortKey, error) {
+	if s == "" {
+		return SortNone, nil
+	}
+	for _, k := range sortKeys {
+		if SortKey(s) == k {
+			return k, nil
+		}
+	}
+
+	names := make([]string, len(sortKeys))
+	for i, k := range sortKeys {
+		names[i] = string(k)
+	}
+	return SortNone, fmt.Errorf(
+		"--sort の値 %q は指定できません。次のいずれかを指定してください: %s",
+		s, strings.Join(names, ", "),
+	)
+}
+
+// reviewRank はレビュー判定の緊急度。小さいほど先に表示する。
+// 「自分が動くべきもの」から順に並べる意図。
+var reviewRank = map[string]int{
+	"CHANGES_REQUESTED": 0,
+	"REVIEW_REQUIRED":   1,
+	"NONE":              2,
+	"APPROVED":          3,
+}
+
+// reviewOrder は判定の緊急度を返す。未知の値は最後尾に回す
+// (gh 側で値が増えても、落とさず末尾に並べるため)。
+func reviewOrder(decision string) int {
+	if r, ok := reviewRank[decision]; ok {
+		return r
+	}
+	return len(reviewRank)
+}
+
+// comparatorFor はキーに対応する比較関数を返す。戻り値は cmp.Compare と同じ規約
+// (a が先なら負、b が先なら正、同順位なら 0)。
+// 同順位のときは cmp.Or で次の基準に進む。
+func comparatorFor(key SortKey) func(a, b Summary) int {
+	switch key {
+	case SortPending:
+		return func(a, b Summary) int {
+			return cmp.Or(
+				cmp.Compare(b.Pending, a.Pending), // 多い順(引数を入れ替えて降順)
+				b.UpdatedAt.Compare(a.UpdatedAt),  // 新しい順
+			)
+		}
+	case SortUpdated:
+		return func(a, b Summary) int {
+			return cmp.Or(
+				b.UpdatedAt.Compare(a.UpdatedAt), // 新しい順
+				cmp.Compare(a.Repo, b.Repo),
+				cmp.Compare(a.Number, b.Number),
+			)
+		}
+	case SortReview:
+		return func(a, b Summary) int {
+			return cmp.Or(
+				cmp.Compare(reviewOrder(a.ReviewDecision), reviewOrder(b.ReviewDecision)),
+				cmp.Compare(b.Pending, a.Pending), // 多い順
+			)
+		}
+	case SortRepo:
+		return func(a, b Summary) int {
+			return cmp.Or(
+				cmp.Compare(a.Repo, b.Repo),
+				cmp.Compare(a.Number, b.Number),
+			)
+		}
+	case SortNumber:
+		return func(a, b Summary) int {
+			return cmp.Or(
+				cmp.Compare(a.Number, b.Number),
+				cmp.Compare(a.Repo, b.Repo),
+			)
+		}
+	default:
+		return nil
+	}
+}
+
+// SortSummaries は s を key の基準で並べ替える(引数のスライスを直接変更する)。
+// key が SortNone の場合は何もしない。reverse が true なら比較結果を反転する。
+// 安定ソートなので、完全に同順位の要素は元の順序を保つ。
+func SortSummaries(s []Summary, key SortKey, reverse bool) {
+	compare := comparatorFor(key)
+	if compare == nil {
+		return
+	}
+	if reverse {
+		base := compare
+		compare = func(a, b Summary) int { return -base(a, b) }
+	}
+	slices.SortStableFunc(s, compare)
+}
+
+// ---------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------
 
@@ -425,7 +548,18 @@ func main() {
 func run() error {
 	// 既定値を "" にして「明示指定」と「未指定(探索する)」を区別する。
 	configFlag := flag.String("config", "", "設定ファイル(YAML)のパス。省略時は ./config.yaml → $XDG_CONFIG_HOME/pr-check/config.yaml → ~/.config/pr-check/config.yaml の順に探索")
+	sortFlag := flag.String("sort", "", "並べ替えの基準: pending(要対応が多い順) / updated(更新が新しい順) / review(レビュー緊急度順) / repo / number。省略時は設定ファイル順")
+	reverseFlag := flag.Bool("reverse", false, "並び順を反転する(--sort と併用)")
 	flag.Parse()
+
+	// 引数の誤りは、時間のかかる gh の呼び出しの前に検出する。
+	sortKey, err := ParseSortKey(*sortFlag)
+	if err != nil {
+		return err
+	}
+	if *reverseFlag && sortKey == SortNone {
+		return fmt.Errorf("--reverse は --sort と一緒に指定してください(例: --sort updated --reverse)")
+	}
 
 	// ホームが取得できなくても致命的ではない(その場合はホーム配下の候補を除外するだけ)。
 	home, _ := os.UserHomeDir()
@@ -464,5 +598,6 @@ func run() error {
 		}
 		all = append(all, summaries...)
 	}
+	SortSummaries(all, sortKey, *reverseFlag)
 	return Render(os.Stdout, all)
 }

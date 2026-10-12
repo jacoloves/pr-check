@@ -197,7 +197,7 @@ func fakeRunner(responses map[string]string) Runner {
 // インラインコメントは --paginate の「配列が連結された出力」を再現している。
 func TestCollect(t *testing.T) {
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number": `[{"number":7}]`,
+		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":7, "updatedAt":"2026-10-01T13:00:00Z"}]`,
 		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "テストPR",
 			"reviewDecision": "CHANGES_REQUESTED",
@@ -209,7 +209,7 @@ func TestCollect(t *testing.T) {
 		"api repos/o/r/pulls/7/comments --paginate": `[{"user":{"login":"bot"},"created_at":"2026-10-01T13:00:00Z"}][{"user":{"login":"alice"},"created_at":"2026-10-01T09:00:00Z"}]`,
 	})
 
-	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me")
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{})
 	if err != nil {
 		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestCollect(t *testing.T) {
 // reviewDecision が空文字のとき NONE と表示されること。
 func TestCollectNoReviewDecision(t *testing.T) {
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number": `[{"number":8}]`,
+		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":8, "updatedAt":"2026-10-01T12:00:00Z"}]`,
 		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "レビュー未設定",
 			"reviewDecision": "",
@@ -241,7 +241,7 @@ func TestCollectNoReviewDecision(t *testing.T) {
 		"api repos/o/r/pulls/8/comments --paginate": `[]`,
 	})
 
-	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me")
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{})
 	if err != nil {
 		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestCollectNoReviewDecision(t *testing.T) {
 // exclude_users に指定したユーザーの行動は要対応に数えないこと。
 func TestCollectExcludeUsers(t *testing.T) {
 	responses := map[string]string{
-		"pr list --repo o/r --author @me --state open --json number": `[{"number":9}]`,
+		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":9, "updatedAt":"2026-10-01T12:00:00Z"}]`,
 		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "除外テスト",
 			"reviewDecision": "",
@@ -266,7 +266,7 @@ func TestCollectExcludeUsers(t *testing.T) {
 	}
 
 	// 除外なし: some-bot と alice の2件
-	got, err := Collect(fakeRunner(responses), "o/r", &Config{Author: "@me"}, "me")
+	got, err := Collect(fakeRunner(responses), "o/r", &Config{Author: "@me"}, "me", time.Time{})
 	if err != nil {
 		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestCollectExcludeUsers(t *testing.T) {
 
 	// some-bot を除外: alice の1件のみ
 	cfg := &Config{Author: "@me", ExcludeUsers: []string{"some-bot"}}
-	got, err = Collect(fakeRunner(responses), "o/r", cfg, "me")
+	got, err = Collect(fakeRunner(responses), "o/r", cfg, "me", time.Time{})
 	if err != nil {
 		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestCollectExcludeUsers(t *testing.T) {
 func TestCollectRunnerError(t *testing.T) {
 	runner := fakeRunner(map[string]string{})
 
-	if _, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me"); err == nil {
+	if _, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{}); err == nil {
 		t.Fatal("gh が失敗したのに Collect() が nil を返しました")
 	}
 }
@@ -805,5 +805,128 @@ func TestRenderColorStyles(t *testing.T) {
 		if !strings.Contains(out, w) {
 			t.Errorf("出力に %q が含まれていません。\n%s", w, out)
 		}
+	}
+}
+
+// ---------------------------------------------------------------
+// --since
+// ---------------------------------------------------------------
+
+func TestParseSince(t *testing.T) {
+	// 現在時刻を固定する(UTC にして、テスト環境のタイムゾーンに依存させない)。
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		in   string
+		want time.Time
+	}{
+		{"7d", time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)},
+		{"1d", time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)},
+		{"2w", time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)},
+		{"36h", time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)},
+		{"90m", time.Date(2026, 10, 11, 10, 30, 0, 0, time.UTC)},
+		{"1h30m", time.Date(2026, 10, 11, 10, 30, 0, 0, time.UTC)},
+		// 日付指定は now のタイムゾーンでの 00:00。
+		{"2026-10-01", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)},
+		// 未来の日付はここではエラーにしない(警告は呼び出し側の責務)。
+		{"2026-12-31", time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)},
+		// 前後の空白は無視する。
+		{" 7d ", time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := ParseSince(tt.in, now)
+			if err != nil {
+				t.Fatalf("ParseSince(%q) が予期せずエラー: %v", tt.in, err)
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("ParseSince(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSinceError(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+
+	for _, in := range []string{
+		"", "abc", "d", "w", "3x", "1.5d", "-1d", "0d", "0w", "0h", "-3h",
+		"2026-13-01", "2026/10/01", "99999999999999999999d", "40000d",
+	} {
+		t.Run(in, func(t *testing.T) {
+			if _, err := ParseSince(in, now); err == nil {
+				t.Errorf("ParseSince(%q) がエラーを返しませんでした", in)
+			}
+		})
+	}
+}
+
+// TestParseSinceErrorMessage は、エラーが許容する形式を案内していることを確認する。
+func TestParseSinceErrorMessage(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+
+	_, err := ParseSince("abc", now)
+	if err == nil {
+		t.Fatal("エラーが返りませんでした")
+	}
+	for _, want := range []string{"abc", "7d", "2w", "36h", "2026-10-01"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("エラーに %q が含まれていません: %v", want, err)
+		}
+	}
+}
+
+// prViewJSON は Collect のテスト用に、`gh pr view` の最小限の応答 JSON を作る。
+func prViewJSON(title, updatedAt string) string {
+	return fmt.Sprintf(
+		`{"title":%q,"reviewDecision":"","updatedAt":%q,"commits":[],"reviews":[],"comments":[]}`,
+		title, updatedAt)
+}
+
+// TestCollectSince は、閾値より古い PR が除外され、詳細取得も行われないことを確認する。
+// 偽 Runner は未登録の呼び出しをエラーにするので、#1 の pr view / api を呼べばテストが失敗する。
+func TestCollectSince(t *testing.T) {
+	const viewFields = "title,reviewDecision,updatedAt,commits,reviews,comments"
+	runner := fakeRunner(map[string]string{
+		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[
+			{"number":1,"updatedAt":"2026-10-01T00:00:00Z"},
+			{"number":2,"updatedAt":"2026-10-05T00:00:00Z"},
+			{"number":3,"updatedAt":"2026-10-09T00:00:00Z"}
+		]`,
+		// #1(範囲外)の応答は意図的に登録しない。
+		"pr view 2 --repo o/r --json " + viewFields: prViewJSON("境界ちょうど", "2026-10-05T00:00:00Z"),
+		"api repos/o/r/pulls/2/comments --paginate": `[]`,
+		"pr view 3 --repo o/r --json " + viewFields: prViewJSON("新しい", "2026-10-09T00:00:00Z"),
+		"api repos/o/r/pulls/3/comments --paginate": `[]`,
+	})
+
+	since := mustTime(t, "2026-10-05T00:00:00Z")
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", since)
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+
+	var nums []int
+	for _, s := range got {
+		nums = append(nums, s.Number)
+	}
+	// #1 は除外、#2 は境界ちょうどなので含まれる、#3 も含まれる。
+	if want := []int{2, 3}; !reflect.DeepEqual(nums, want) {
+		t.Errorf("PR 番号 = %v, want %v", nums, want)
+	}
+}
+
+// TestCollectSinceNoMatch は、全件が範囲外のとき空の結果になる(エラーにならない)ことを確認する。
+func TestCollectSinceNoMatch(t *testing.T) {
+	runner := fakeRunner(map[string]string{
+		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":1,"updatedAt":"2026-01-01T00:00:00Z"}]`,
+	})
+
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", mustTime(t, "2026-10-01T00:00:00Z"))
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("結果 = %d 件, want 0 件", len(got))
 	}
 }

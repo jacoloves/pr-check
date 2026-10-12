@@ -315,6 +315,11 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 // 収集
 // ---------------------------------------------------------------
 
+// prListLimit は 1 リポジトリあたりに取得する PR の最大件数。
+// gh pr list は --limit を省略すると 30 件で打ち切るため、PR を黙って取りこぼさないよう明示する。
+// 対象は「自分が作成したオープンな PR」なので、200 件あれば実用上十分と判断している。
+const prListLimit = 200
+
 // Summary は1PR分の表示内容。
 type Summary struct {
 	Repo           string
@@ -335,7 +340,8 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		exclude[u] = true
 	}
 
-	out, err := run("pr", "list", "--repo", repo, "--author", cfg.Author, "--state", "open", "--json", "number,updatedAt")
+	out, err := run("pr", "list", "--repo", repo, "--author", cfg.Author, "--state", "open",
+		"--limit", strconv.Itoa(prListLimit), "--json", "number,updatedAt")
 	if err != nil {
 		return nil, err
 	}

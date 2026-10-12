@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -251,6 +252,66 @@ func decodeAll[T any](data []byte) ([]T, error) {
 }
 
 // ---------------------------------------------------------------
+// --since
+// ---------------------------------------------------------------
+
+// sinceDaysPattern は "7d" / "2w" のような、日・週単位の期間表記にマッチする。
+// time.ParseDuration は d(日)と w(週)を扱えないため、自前で処理する。
+var sinceDaysPattern = regexp.MustCompile(`^([0-9]+)([dw])$`)
+
+// maxSinceDays は --since に指定できる日数の上限(約100年)。
+// 極端に大きい値で日付計算が壊れるのを防ぐ。
+const maxSinceDays = 36500
+
+// ParseSince は --since の文字列を「この日時以降」という閾値に変換する。
+//
+// 受け付ける形式:
+//   - 日・週: "7d", "2w"(暦の上での N 日・N 週間前)
+//   - 時間・分など: time.ParseDuration の形式("36h", "90m", "1h30m")
+//   - 日付: "2026-10-01"(now と同じタイムゾーンの 00:00)
+//
+// 現在時刻 now を引数で受け取るのは、テストで時刻を固定するため。
+func ParseSince(s string, now time.Time) (time.Time, error) {
+	s = strings.TrimSpace(s)
+
+	// 1) 日・週
+	if m := sinceDaysPattern.FindStringSubmatch(s); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return time.Time{}, fmt.Errorf(
+				"--since の値 %q の数値が大きすぎます。%d 日以内の範囲で指定してください", s, maxSinceDays)
+		}
+		days := n
+		if m[2] == "w" {
+			days = n * 7
+		}
+		if days <= 0 {
+			return time.Time{}, fmt.Errorf("--since の値 %q は 0 です。1 以上の期間を指定してください(例: 7d)", s)
+		}
+		if days > maxSinceDays {
+			return time.Time{}, fmt.Errorf("--since の値 %q は大きすぎます。%d 日以内の範囲で指定してください", s, maxSinceDays)
+		}
+		return now.AddDate(0, 0, -days), nil
+	}
+
+	// 2) time.ParseDuration の形式(h, m, s など)
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return time.Time{}, fmt.Errorf("--since の値 %q は 0 以下です。1 以上の期間を指定してください(例: 36h)", s)
+		}
+		return now.Add(-d), nil
+	}
+
+	// 3) 日付(now と同じタイムゾーンの 00:00)
+	if t, err := time.ParseInLocation("2006-01-02", s, now.Location()); err == nil {
+		return t, nil
+	}
+
+	return time.Time{}, fmt.Errorf(
+		"--since の値 %q を解釈できません。7d や 2w や 36h や 90m のような期間、または 2026-10-01 のような日付で指定してください", s)
+}
+
+// ---------------------------------------------------------------
 // 収集
 // ---------------------------------------------------------------
 
@@ -267,19 +328,20 @@ type Summary struct {
 // Collect は1つのリポジトリについて、cfg.Author のオープンPRを列挙し、
 // それぞれの要約を作る。self は「自分の行動」とみなす作成者のログイン名
 // ("@me" 解決済みの値)。
-func Collect(run Runner, repo string, cfg *Config, self string) ([]Summary, error) {
+func Collect(run Runner, repo string, cfg *Config, self string, since time.Time) ([]Summary, error) {
 	// 除外ユーザーを高速に引けるよう集合にする。
 	exclude := make(map[string]bool, len(cfg.ExcludeUsers))
 	for _, u := range cfg.ExcludeUsers {
 		exclude[u] = true
 	}
 
-	out, err := run("pr", "list", "--repo", repo, "--author", cfg.Author, "--state", "open", "--json", "number")
+	out, err := run("pr", "list", "--repo", repo, "--author", cfg.Author, "--state", "open", "--json", "number,updatedAt")
 	if err != nil {
 		return nil, err
 	}
 	var list []struct {
-		Number int `json:"number"`
+		Number    int       `json:"number"`
+		UpdatedAt time.Time `json:"updatedAt"`
 	}
 	if err := json.Unmarshal(out, &list); err != nil {
 		return nil, fmt.Errorf("%s のPR一覧のパースに失敗しました: %w", repo, err)
@@ -287,6 +349,11 @@ func Collect(run Runner, repo string, cfg *Config, self string) ([]Summary, erro
 
 	var result []Summary
 	for _, p := range list {
+		// --since より古い PR は、詳細取得(gh を 2 回呼ぶ)をする前に除外する。
+		// since がゼロ値のときは絞り込まない。境界ちょうどは含める。
+		if !since.IsZero() && p.UpdatedAt.Before(since) {
+			continue
+		}
 		num := fmt.Sprint(p.Number)
 
 		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,reviews,comments")
@@ -655,6 +722,7 @@ func run() error {
 	sortFlag := flag.String("sort", "", "並べ替えの基準: pending(要対応が多い順) / updated(更新が新しい順) / review(レビュー緊急度順) / repo / number。省略時は設定ファイル順")
 	reverseFlag := flag.Bool("reverse", false, "並び順を反転する(--sort と併用)")
 	colorFlag := flag.String("color", "auto", "色付け: auto(端末のときだけ) / always / never。auto では NO_COLOR 環境変数も尊重する")
+	sinceFlag := flag.String("since", "", "この期間内に更新されたPRだけ表示: 7d / 2w / 36h / 90m / 2026-10-01(日付)。省略時は全件")
 	flag.Parse()
 
 	// 引数の誤りは、時間のかかる gh の呼び出しの前に検出する。
@@ -668,6 +736,17 @@ func run() error {
 	useColor, err := ShouldColor(*colorFlag, os.Getenv, isTerminal(os.Stdout))
 	if err != nil {
 		return err
+	}
+	var since time.Time
+	if *sinceFlag != "" {
+		now := time.Now()
+		since, err = ParseSince(*sinceFlag, now)
+		if err != nil {
+			return err
+		}
+		if since.After(now) {
+			fmt.Fprintf(os.Stderr, "警告: --since %q は未来の日時です。該当する PR は 0 件になります\n", *sinceFlag)
+		}
 	}
 
 	// ホームが取得できなくても致命的ではない(その場合はホーム配下の候補を除外するだけ)。
@@ -701,7 +780,7 @@ func run() error {
 	// (後続のソートは「全件が揃っていること」が前提になるため)
 	var all []Summary
 	for _, repo := range cfg.Repositories {
-		summaries, err := Collect(ghRun, repo, cfg, self)
+		summaries, err := Collect(ghRun, repo, cfg, self, since)
 		if err != nil {
 			return err
 		}

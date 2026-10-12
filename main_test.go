@@ -198,14 +198,14 @@ func fakeRunner(responses map[string]string) Runner {
 func TestCollect(t *testing.T) {
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":7, "updatedAt":"2026-10-01T13:00:00Z"}]`,
-		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
+		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
 			"title": "テストPR",
 			"reviewDecision": "CHANGES_REQUESTED",
 			"updatedAt": "2026-10-01T13:00:00Z",
 			"commits": [{"committedDate": "2026-10-01T10:00:00Z"}],
-			"reviews": [{"author": {"login": "alice"}, "submittedAt": "2026-10-01T11:00:00Z"}],
 			"comments": [{"author": {"login": "me"}, "createdAt": "2026-10-01T12:00:00Z"}]
 		}`,
+		"api repos/o/r/pulls/7/reviews --paginate": `[{"id":1,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
 		"api repos/o/r/pulls/7/comments --paginate": `[{"user":{"login":"bot"},"created_at":"2026-10-01T13:00:00Z"}][{"user":{"login":"alice"},"created_at":"2026-10-01T09:00:00Z"}]`,
 	})
 
@@ -214,7 +214,7 @@ func TestCollect(t *testing.T) {
 		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
 	}
 	if len(got) != 1 {
-		t.Fatalf("PR 件数 = %d, want 1", err)
+		t.Fatalf("PR 件数 = %d, want 1", len(got))
 	}
 	s := got[0]
 	if s.Repo != "o/r" || s.Number != 7 || s.Title != "テストPR" {
@@ -232,12 +232,13 @@ func TestCollect(t *testing.T) {
 func TestCollectNoReviewDecision(t *testing.T) {
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":8, "updatedAt":"2026-10-01T12:00:00Z"}]`,
-		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
+		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
 			"title": "レビュー未設定",
 			"reviewDecision": "",
 			"updatedAt": "2026-10-01T10:00:00Z",
 			"commits": [], "reviews": [], "comments": []
 		}`,
+		"api repos/o/r/pulls/8/reviews --paginate": `[]`,
 		"api repos/o/r/pulls/8/comments --paginate": `[]`,
 	})
 
@@ -254,14 +255,14 @@ func TestCollectNoReviewDecision(t *testing.T) {
 func TestCollectExcludeUsers(t *testing.T) {
 	responses := map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":9, "updatedAt":"2026-10-01T12:00:00Z"}]`,
-		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
+		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
 			"title": "除外テスト",
 			"reviewDecision": "",
 			"updatedAt": "2026-10-01T12:00:00Z",
 			"commits": [{"committedDate": "2026-10-01T10:00:00Z"}],
-			"reviews": [{"author": {"login": "some-bot"}, "submittedAt": "2026-10-01T11:00:00Z"}],
 			"comments": [{"author": {"login": "alice"}, "createdAt": "2026-10-01T12:00:00Z"}]
 		}`,
+		"api repos/o/r/pulls/9/reviews --paginate": `[{"id":2,"user":{"login":"some-bot"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
 		"api repos/o/r/pulls/9/comments --paginate": `[]`,
 	}
 
@@ -879,14 +880,14 @@ func TestParseSinceErrorMessage(t *testing.T) {
 // prViewJSON は Collect のテスト用に、`gh pr view` の最小限の応答 JSON を作る。
 func prViewJSON(title, updatedAt string) string {
 	return fmt.Sprintf(
-		`{"title":%q,"reviewDecision":"","updatedAt":%q,"commits":[],"reviews":[],"comments":[]}`,
+		`{"title":%q,"reviewDecision":"","updatedAt":%q,"commits":[],"comments":[]}`,
 		title, updatedAt)
 }
 
 // TestCollectSince は、閾値より古い PR が除外され、詳細取得も行われないことを確認する。
 // 偽 Runner は未登録の呼び出しをエラーにするので、#1 の pr view / api を呼べばテストが失敗する。
 func TestCollectSince(t *testing.T) {
-	const viewFields = "title,reviewDecision,updatedAt,commits,reviews,comments"
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[
 			{"number":1,"updatedAt":"2026-10-01T00:00:00Z"},
@@ -895,8 +896,10 @@ func TestCollectSince(t *testing.T) {
 		]`,
 		// #1(範囲外)の応答は意図的に登録しない。
 		"pr view 2 --repo o/r --json " + viewFields: prViewJSON("境界ちょうど", "2026-10-05T00:00:00Z"),
+		"api repos/o/r/pulls/2/reviews --paginate": `[]`,
 		"api repos/o/r/pulls/2/comments --paginate": `[]`,
 		"pr view 3 --repo o/r --json " + viewFields: prViewJSON("新しい", "2026-10-09T00:00:00Z"),
+		"api repos/o/r/pulls/3/reviews --paginate": `[]`,
 		"api repos/o/r/pulls/3/comments --paginate": `[]`,
 	})
 
@@ -952,5 +955,133 @@ func TestCollectPassesLimit(t *testing.T) {
 	}
 	if !strings.Contains(listArgs, "--limit 200") {
 		t.Errorf("pr list に --limit 200 が渡されていません: %q", listArgs)
+	}
+}
+
+// ---------------------------------------------------------------
+// 二重カウントの解消(レビュー本体 × コード行コメント)
+// ---------------------------------------------------------------
+
+// TestDropAbsorbedInline は、提出済みレビューに属するコード行コメントだけが取り除かれ、
+// 紐づけが確定できないものは残る(=多めに数える方向に倒す)ことを確認する。
+func TestDropAbsorbedInline(t *testing.T) {
+	at := mustTime(t, "2026-10-01T11:00:00Z")
+	submitted := restReview{ID: 100, User: author{Login: "alice"}, SubmittedAt: at}
+	pending := restReview{ID: 200, User: author{Login: "me"}}
+
+	tests := []struct {
+		name string
+		inline []inlineComment
+		reviews []restReview
+		want []int64
+	}{
+		{
+			name: "レビューが無ければ全て残す",
+			inline: []inlineComment{{ReviewID: 100}, {ReviewID: 0}},
+			reviews: nil,
+			want: []int64{100, 0},
+		},
+		{
+			name: "提出済みレビューに属するものは取り除く",
+			inline: []inlineComment{{ReviewID: 100}, {ReviewID: 100}, {ReviewID: 100}},
+			reviews: []restReview{submitted},
+			want: nil,
+		},
+		{
+			name: "review_id が 0(紐づかない)ものは残す",
+			inline: []inlineComment{{ReviewID: 0}},
+			reviews: []restReview{submitted},
+			want: []int64{0},
+		},
+		{
+			name: "対応するレビューが一覧に無いものは残す",
+			inline: []inlineComment{{ReviewID: 999}},
+			reviews: []restReview{submitted},
+			want: []int64{999},
+		},
+		{
+			name: "未提出(pending)レビューに属するものは残す",
+			inline: []inlineComment{{ReviewID: 200}},
+			reviews: []restReview{pending},
+			want: []int64{200},
+		},
+		{
+			name: "混在していても、取り除くのは提出済みに属するものだけ",
+			inline:[]inlineComment{{ReviewID: 100}, {ReviewID: 0}, {ReviewID: 200}, {ReviewID: 100}},
+			reviews: []restReview{submitted, pending},
+			want: []int64{0, 200},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []int64
+			for _, c := range dropAbsorbedInline(tt.inline, tt.reviews) {
+				got = append(got, c.ReviewID)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("残ったコメントの ReviewID = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCollectDedupInline は、1回のレビューに行コメントが3件付いても、要対応が1件になることを確認する。
+// レビューに属さない行コメント(review_id なし)は、従来どおり1件として数える。
+// 修正前は 1(レビュー本体) + 3(行コメント) + 1(属さない行コメント) = 5 になっていた。
+func TestCollectDedupInline(t *testing.T) {
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
+	runner := fakeRunner(map[string]string{
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":10,"updatedAt":"2026-10-01T12:00:00Z"}]`,
+		"pr view 10 --repo o/r --json " + viewFields:                             prViewJSON("二重カウント", "2026-10-01T12:00:00Z"),
+		"api repos/o/r/pulls/10/reviews --paginate": `[{"id":100,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
+		"api repos/o/r/pulls/10/comments --paginate": `[
+			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
+			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
+			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:01Z","pull_request_review_id":100},
+			{"user":{"login":"bob"},"created_at":"2026-10-01T11:30:00Z"}
+		]`,
+	})
+
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("PR 件数 = %d, want 1", len(got))
+	}
+	// alice のレビュー 1 件 + bob の(レビューに属さない)行コメント 1 件
+	if got[0].Pending != 2 {
+		t.Errorf("Pending = %d, want 2", got[0].Pending)
+	}
+}
+
+// TestCollectDedupReply は、自分が返信した後に相手が再度レビューした場合を確認する。
+// 自分の最終アクションより後の、相手の「レビュー提出 1 回」だけが 1 件になる。
+//   11:00 alice がレビュー(行コメント2件) → 12:00 自分がレビューで返信 → 13:00 alice が返信(行コメント1件)
+func TestCollectDedupReply(t *testing.T) {
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
+	runner := fakeRunner(map[string]string{
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":11,"updatedAt":"2026-10-01T13:00:00Z"}]`,
+		"pr view 11 --repo o/r --json " + viewFields:                             prViewJSON("返信", "2026-10-01T13:00:00Z"),
+		"api repos/o/r/pulls/11/reviews --paginate": `[
+			{"id":100,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"},
+			{"id":101,"user":{"login":"me"},"submitted_at":"2026-10-01T12:00:00Z"},
+			{"id":102,"user":{"login":"alice"},"submitted_at":"2026-10-01T13:00:00Z"}
+		]`,
+		"api repos/o/r/pulls/11/comments --paginate": `[
+			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
+			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
+			{"user":{"login":"me"},"created_at":"2026-10-01T12:00:00Z","pull_request_review_id":101},
+			{"user":{"login":"alice"},"created_at":"2026-10-01T13:00:00Z","pull_request_review_id":102}
+		]`,
+	})
+
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if got[0].Pending != 1 {
+		t.Errorf("Pending = %d, want 1", got[0].Pending)
 	}
 }

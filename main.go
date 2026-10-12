@@ -219,10 +219,6 @@ type prView struct {
 	Commits        []struct {
 		CommittedDate time.Time `json:"committedDate"`
 	} `json:"commits"`
-	Reviews []struct {
-		Author      author    `json:"author"`
-		SubmittedAt time.Time `json:"submittedAt"`
-	} `json:"reviews"`
 	Comments []struct {
 		Author    author    `json:"author"`
 		CreatedAt time.Time `json:"createdAt"`
@@ -234,6 +230,18 @@ type prView struct {
 type inlineComment struct {
 	User      author    `json:"user"`
 	CreatedAt time.Time `json:"created_at"`
+	// ReviewID は、このコメントが属するレビューの ID(数値)。
+	// GitHub ではコード行コメントは必ずレビューに属する。属さない/不明な場合は 0。
+	ReviewID int64 `json:"pull_request_review_id"`
+}
+
+// restReview は REST API(repos/{repo}/pulls/{n}/reviews)のレビュー。
+// gh pr view の reviews.id は GraphQL のノード ID(文字列)で、行コメントの
+// pull_request_review_id(数値)と突き合わせられないため、REST 側の数値 ID を使う。
+type restReview struct {
+	ID          int64     `json:"id"`
+	User        author    `json:"user"`
+	SubmittedAt time.Time `json:"submitted_at"`
 }
 
 // decodeAll は `gh api --paginate` が出す「配列が連結された出力」を全て読み込む。
@@ -249,6 +257,36 @@ func decodeAll[T any](data []byte) ([]T, error) {
 		}
 		all = append(all, page...)
 	}
+}
+
+// dropAbsorbedInline は、提出済みレビューに属するコード行コメントを取り除く。
+//
+// GitHub では、レビューを1回提出すると「レビュー本体」と「そのレビューに属する
+// コード行コメント N 件」が同時にできる。両方を数えると1回のレビューが N+1 件に
+// なってしまうため、レビュー本体を1アクションとして数え、属する行コメントは捨てる。
+//
+// 次の行コメントは取り除かず、そのまま残す(=多めに数える側に倒す)。
+//   - ReviewID が 0 のもの(紐づけ先が不明)
+//   - 対応するレビューが一覧に無いもの
+//   - 未提出(SubmittedAt がゼロ値)のレビューに属するもの
+//     (書きかけのレビューの行コメントまで捨てると、自分の最終アクション時刻が失われるため)
+func dropAbsorbedInline(inline []inlineComment, reviews []restReview) []inlineComment {
+	// 提出済みレビューの ID を集合にして、高速に引けるようにする。
+	submitted := make(map[int64]bool, len(reviews))
+	for _, r := range reviews {
+		if !r.SubmittedAt.IsZero() {
+			submitted[r.ID] = true
+		}
+	}
+
+	var rest []inlineComment
+	for _, c := range inline {
+		if c.ReviewID != 0 && submitted[c.ReviewID] {
+			continue // 提出済みレビューに属する → レビュー本体で数えるので捨てる
+		}
+		rest = append(rest, c)
+	}
+	return rest
 }
 
 // ---------------------------------------------------------------
@@ -362,13 +400,23 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		}
 		num := fmt.Sprint(p.Number)
 
-		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,reviews,comments")
+		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments")
 		if err != nil {
 			return nil, err
 		}
 		var v prView
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, fmt.Errorf("%s の PR #%s の詳細のパースに失敗しました: %w", repo, num, err)
+		}
+
+		// レビューは REST から取得する(行コメントとの紐づけに数値 ID が必要なため)。
+		rawReviews, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/reviews", repo, num), "--paginate")
+		if err != nil {
+			return nil, err
+		}
+		reviews, err := decodeAll[restReview](rawReviews)
+		if err != nil {
+			return nil, err
 		}
 
 		rawInline, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/comments", repo, num), "--paginate")
@@ -379,6 +427,8 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		if err != nil {
 			return nil, err
 		}
+
+		inline = dropAbsorbedInline(inline, reviews)
 
 		// 取得元ごとの違いを Event に正規化する。
 		// 他者のうち exclude_users に含まれるユーザーの行動は追加しない。
@@ -393,8 +443,8 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		for _, c := range v.Commits {
 			add(c.CommittedDate, self)
 		}
-		for _, r := range v.Reviews {
-			add(r.SubmittedAt, r.Author.Login)
+		for _, r := range reviews {
+			add(r.SubmittedAt, r.User.Login)
 		}
 		for _, c := range v.Comments {
 			add(c.CreatedAt, c.Author.Login)

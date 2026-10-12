@@ -62,6 +62,39 @@ GitHub では、レビューを1回提出すると「レビュー本体」と「
 
 ## インストール・ビルド
 
+### `go install` で入れる(別PCへの導入におすすめ)
+
+```sh
+# インストール($(go env GOPATH)/bin、通常は ~/go/bin に pr-check が入る)
+go install github.com/jacoloves/pr-check@latest
+
+# PATH に通っていない場合(コマンドが見つからないとき)
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc
+
+# 設定ファイルを作る(詳細は「設定ファイル」を参照)
+mkdir -p ~/.config/pr-check
+curl -fsSL https://raw.githubusercontent.com/jacoloves/pr-check/master/config.example.yaml \
+  -o ~/.config/pr-check/config.yaml
+$EDITOR ~/.config/pr-check/config.yaml
+
+pr-check
+```
+
+- 更新するときも同じ `go install ...@latest` を実行します。
+- Go のバージョンが `go.mod` の指定(1.26.8 以上)より古いと、インストールに失敗します。
+
+#### GitHub Enterprise を使う場合
+
+`gh` は接続先を `GH_HOST` 環境変数で決めます。`gh` の既定ホストが github.com のままだと、`pr-check` も github.com に問い合わせてしまい、404 などで失敗します。その場合は接続先ホストを指定してください。
+
+```sh
+gh auth status                                # 対象ホストに Logged in か確認
+GH_HOST=github.example.com pr-check           # 1回だけ指定して試す
+echo 'export GH_HOST=github.example.com' >> ~/.zshrc   # 常用するなら
+```
+
+### ソースからビルドする
+
 ```sh
 git clone https://github.com/jacoloves/pr-check.git
 cd pr-check

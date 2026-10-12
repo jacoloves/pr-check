@@ -197,7 +197,7 @@ func fakeRunner(responses map[string]string) Runner {
 // インラインコメントは --paginate の「配列が連結された出力」を再現している。
 func TestCollect(t *testing.T) {
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":7, "updatedAt":"2026-10-01T13:00:00Z"}]`,
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":7, "updatedAt":"2026-10-01T13:00:00Z"}]`,
 		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "テストPR",
 			"reviewDecision": "CHANGES_REQUESTED",
@@ -231,7 +231,7 @@ func TestCollect(t *testing.T) {
 // reviewDecision が空文字のとき NONE と表示されること。
 func TestCollectNoReviewDecision(t *testing.T) {
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":8, "updatedAt":"2026-10-01T12:00:00Z"}]`,
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":8, "updatedAt":"2026-10-01T12:00:00Z"}]`,
 		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "レビュー未設定",
 			"reviewDecision": "",
@@ -253,7 +253,7 @@ func TestCollectNoReviewDecision(t *testing.T) {
 // exclude_users に指定したユーザーの行動は要対応に数えないこと。
 func TestCollectExcludeUsers(t *testing.T) {
 	responses := map[string]string{
-		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":9, "updatedAt":"2026-10-01T12:00:00Z"}]`,
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":9, "updatedAt":"2026-10-01T12:00:00Z"}]`,
 		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,reviews,comments": `{
 			"title": "除外テスト",
 			"reviewDecision": "",
@@ -888,7 +888,7 @@ func prViewJSON(title, updatedAt string) string {
 func TestCollectSince(t *testing.T) {
 	const viewFields = "title,reviewDecision,updatedAt,commits,reviews,comments"
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[
 			{"number":1,"updatedAt":"2026-10-01T00:00:00Z"},
 			{"number":2,"updatedAt":"2026-10-05T00:00:00Z"},
 			{"number":3,"updatedAt":"2026-10-09T00:00:00Z"}
@@ -919,7 +919,7 @@ func TestCollectSince(t *testing.T) {
 // TestCollectSinceNoMatch は、全件が範囲外のとき空の結果になる(エラーにならない)ことを確認する。
 func TestCollectSinceNoMatch(t *testing.T) {
 	runner := fakeRunner(map[string]string{
-		"pr list --repo o/r --author @me --state open --json number,updatedAt": `[{"number":1,"updatedAt":"2026-01-01T00:00:00Z"}]`,
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":1,"updatedAt":"2026-01-01T00:00:00Z"}]`,
 	})
 
 	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", mustTime(t, "2026-10-01T00:00:00Z"))
@@ -928,5 +928,29 @@ func TestCollectSinceNoMatch(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("結果 = %d 件, want 0 件", len(got))
+	}
+}
+
+// ---------------------------------------------------------------
+// 取得件数の上限
+// ---------------------------------------------------------------
+
+// TestCollectPassesLimit は、gh pr list に --limit が明示されることを確認する。
+// 省略すると gh の既定(30件)で打ち切られ、PR を黙って取りこぼすため。
+func TestCollectPassesLimit(t *testing.T) {
+	var listArgs string
+	runner := func(args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+			listArgs = strings.Join(args, " ")
+			return []byte(`[]`), nil
+		}
+		return nil, fmt.Errorf("想定外の gh 呼び出しです: %v", args)
+	}
+
+	if _, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{}); err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if !strings.Contains(listArgs, "--limit 200") {
+		t.Errorf("pr list に --limit 200 が渡されていません: %q", listArgs)
 	}
 }

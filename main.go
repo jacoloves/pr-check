@@ -216,6 +216,7 @@ type prView struct {
 	Title          string    `json:"title"`
 	ReviewDecision string    `json:"reviewDecision"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+	URL            string    `json:"url"`
 	Commits        []struct {
 		CommittedDate time.Time `json:"committedDate"`
 	} `json:"commits"`
@@ -366,6 +367,7 @@ type Summary struct {
 	ReviewDecision string
 	Pending        int
 	UpdatedAt      time.Time
+	URL            string
 }
 
 // Collect は1つのリポジトリについて、cfg.Author のオープンPRを列挙し、
@@ -400,7 +402,7 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		}
 		num := fmt.Sprint(p.Number)
 
-		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments")
+		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments,url")
 		if err != nil {
 			return nil, err
 		}
@@ -464,6 +466,7 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 			ReviewDecision: decision,
 			Pending:        CountPending(events, self),
 			UpdatedAt:      v.UpdatedAt,
+			URL:            v.URL,
 		})
 	}
 	return result, nil

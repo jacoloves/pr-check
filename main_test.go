@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -198,14 +199,14 @@ func fakeRunner(responses map[string]string) Runner {
 func TestCollect(t *testing.T) {
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":7, "updatedAt":"2026-10-01T13:00:00Z"}]`,
-		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
+		"pr view 7 --repo o/r --json title,reviewDecision,updatedAt,commits,comments,url": `{
 			"title": "テストPR",
 			"reviewDecision": "CHANGES_REQUESTED",
 			"updatedAt": "2026-10-01T13:00:00Z",
 			"commits": [{"committedDate": "2026-10-01T10:00:00Z"}],
 			"comments": [{"author": {"login": "me"}, "createdAt": "2026-10-01T12:00:00Z"}]
 		}`,
-		"api repos/o/r/pulls/7/reviews --paginate": `[{"id":1,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
+		"api repos/o/r/pulls/7/reviews --paginate":  `[{"id":1,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
 		"api repos/o/r/pulls/7/comments --paginate": `[{"user":{"login":"bot"},"created_at":"2026-10-01T13:00:00Z"}][{"user":{"login":"alice"},"created_at":"2026-10-01T09:00:00Z"}]`,
 	})
 
@@ -232,13 +233,13 @@ func TestCollect(t *testing.T) {
 func TestCollectNoReviewDecision(t *testing.T) {
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":8, "updatedAt":"2026-10-01T12:00:00Z"}]`,
-		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
+		"pr view 8 --repo o/r --json title,reviewDecision,updatedAt,commits,comments,url": `{
 			"title": "レビュー未設定",
 			"reviewDecision": "",
 			"updatedAt": "2026-10-01T10:00:00Z",
 			"commits": [], "reviews": [], "comments": []
 		}`,
-		"api repos/o/r/pulls/8/reviews --paginate": `[]`,
+		"api repos/o/r/pulls/8/reviews --paginate":  `[]`,
 		"api repos/o/r/pulls/8/comments --paginate": `[]`,
 	})
 
@@ -255,14 +256,14 @@ func TestCollectNoReviewDecision(t *testing.T) {
 func TestCollectExcludeUsers(t *testing.T) {
 	responses := map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":9, "updatedAt":"2026-10-01T12:00:00Z"}]`,
-		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,comments": `{
+		"pr view 9 --repo o/r --json title,reviewDecision,updatedAt,commits,comments,url": `{
 			"title": "除外テスト",
 			"reviewDecision": "",
 			"updatedAt": "2026-10-01T12:00:00Z",
 			"commits": [{"committedDate": "2026-10-01T10:00:00Z"}],
 			"comments": [{"author": {"login": "alice"}, "createdAt": "2026-10-01T12:00:00Z"}]
 		}`,
-		"api repos/o/r/pulls/9/reviews --paginate": `[{"id":2,"user":{"login":"some-bot"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
+		"api repos/o/r/pulls/9/reviews --paginate":  `[{"id":2,"user":{"login":"some-bot"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
 		"api repos/o/r/pulls/9/comments --paginate": `[]`,
 	}
 
@@ -887,7 +888,7 @@ func prViewJSON(title, updatedAt string) string {
 // TestCollectSince は、閾値より古い PR が除外され、詳細取得も行われないことを確認する。
 // 偽 Runner は未登録の呼び出しをエラーにするので、#1 の pr view / api を呼べばテストが失敗する。
 func TestCollectSince(t *testing.T) {
-	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments,url"
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[
 			{"number":1,"updatedAt":"2026-10-01T00:00:00Z"},
@@ -896,10 +897,10 @@ func TestCollectSince(t *testing.T) {
 		]`,
 		// #1(範囲外)の応答は意図的に登録しない。
 		"pr view 2 --repo o/r --json " + viewFields: prViewJSON("境界ちょうど", "2026-10-05T00:00:00Z"),
-		"api repos/o/r/pulls/2/reviews --paginate": `[]`,
+		"api repos/o/r/pulls/2/reviews --paginate":  `[]`,
 		"api repos/o/r/pulls/2/comments --paginate": `[]`,
 		"pr view 3 --repo o/r --json " + viewFields: prViewJSON("新しい", "2026-10-09T00:00:00Z"),
-		"api repos/o/r/pulls/3/reviews --paginate": `[]`,
+		"api repos/o/r/pulls/3/reviews --paginate":  `[]`,
 		"api repos/o/r/pulls/3/comments --paginate": `[]`,
 	})
 
@@ -970,46 +971,46 @@ func TestDropAbsorbedInline(t *testing.T) {
 	pending := restReview{ID: 200, User: author{Login: "me"}}
 
 	tests := []struct {
-		name string
-		inline []inlineComment
+		name    string
+		inline  []inlineComment
 		reviews []restReview
-		want []int64
+		want    []int64
 	}{
 		{
-			name: "レビューが無ければ全て残す",
-			inline: []inlineComment{{ReviewID: 100}, {ReviewID: 0}},
+			name:    "レビューが無ければ全て残す",
+			inline:  []inlineComment{{ReviewID: 100}, {ReviewID: 0}},
 			reviews: nil,
-			want: []int64{100, 0},
+			want:    []int64{100, 0},
 		},
 		{
-			name: "提出済みレビューに属するものは取り除く",
-			inline: []inlineComment{{ReviewID: 100}, {ReviewID: 100}, {ReviewID: 100}},
+			name:    "提出済みレビューに属するものは取り除く",
+			inline:  []inlineComment{{ReviewID: 100}, {ReviewID: 100}, {ReviewID: 100}},
 			reviews: []restReview{submitted},
-			want: nil,
+			want:    nil,
 		},
 		{
-			name: "review_id が 0(紐づかない)ものは残す",
-			inline: []inlineComment{{ReviewID: 0}},
+			name:    "review_id が 0(紐づかない)ものは残す",
+			inline:  []inlineComment{{ReviewID: 0}},
 			reviews: []restReview{submitted},
-			want: []int64{0},
+			want:    []int64{0},
 		},
 		{
-			name: "対応するレビューが一覧に無いものは残す",
-			inline: []inlineComment{{ReviewID: 999}},
+			name:    "対応するレビューが一覧に無いものは残す",
+			inline:  []inlineComment{{ReviewID: 999}},
 			reviews: []restReview{submitted},
-			want: []int64{999},
+			want:    []int64{999},
 		},
 		{
-			name: "未提出(pending)レビューに属するものは残す",
-			inline: []inlineComment{{ReviewID: 200}},
+			name:    "未提出(pending)レビューに属するものは残す",
+			inline:  []inlineComment{{ReviewID: 200}},
 			reviews: []restReview{pending},
-			want: []int64{200},
+			want:    []int64{200},
 		},
 		{
-			name: "混在していても、取り除くのは提出済みに属するものだけ",
-			inline:[]inlineComment{{ReviewID: 100}, {ReviewID: 0}, {ReviewID: 200}, {ReviewID: 100}},
+			name:    "混在していても、取り除くのは提出済みに属するものだけ",
+			inline:  []inlineComment{{ReviewID: 100}, {ReviewID: 0}, {ReviewID: 200}, {ReviewID: 100}},
 			reviews: []restReview{submitted, pending},
-			want: []int64{0, 200},
+			want:    []int64{0, 200},
 		},
 	}
 
@@ -1030,11 +1031,11 @@ func TestDropAbsorbedInline(t *testing.T) {
 // レビューに属さない行コメント(review_id なし)は、従来どおり1件として数える。
 // 修正前は 1(レビュー本体) + 3(行コメント) + 1(属さない行コメント) = 5 になっていた。
 func TestCollectDedupInline(t *testing.T) {
-	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments,url"
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":10,"updatedAt":"2026-10-01T12:00:00Z"}]`,
-		"pr view 10 --repo o/r --json " + viewFields:                             prViewJSON("二重カウント", "2026-10-01T12:00:00Z"),
-		"api repos/o/r/pulls/10/reviews --paginate": `[{"id":100,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
+		"pr view 10 --repo o/r --json " + viewFields:                                       prViewJSON("二重カウント", "2026-10-01T12:00:00Z"),
+		"api repos/o/r/pulls/10/reviews --paginate":                                        `[{"id":100,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"}]`,
 		"api repos/o/r/pulls/10/comments --paginate": `[
 			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
 			{"user":{"login":"alice"},"created_at":"2026-10-01T11:00:00Z","pull_request_review_id":100},
@@ -1058,12 +1059,13 @@ func TestCollectDedupInline(t *testing.T) {
 
 // TestCollectDedupReply は、自分が返信した後に相手が再度レビューした場合を確認する。
 // 自分の最終アクションより後の、相手の「レビュー提出 1 回」だけが 1 件になる。
-//   11:00 alice がレビュー(行コメント2件) → 12:00 自分がレビューで返信 → 13:00 alice が返信(行コメント1件)
+//
+//	11:00 alice がレビュー(行コメント2件) → 12:00 自分がレビューで返信 → 13:00 alice が返信(行コメント1件)
 func TestCollectDedupReply(t *testing.T) {
-	const viewFields = "title,reviewDecision,updatedAt,commits,comments"
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments,url"
 	runner := fakeRunner(map[string]string{
 		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":11,"updatedAt":"2026-10-01T13:00:00Z"}]`,
-		"pr view 11 --repo o/r --json " + viewFields:                             prViewJSON("返信", "2026-10-01T13:00:00Z"),
+		"pr view 11 --repo o/r --json " + viewFields:                                       prViewJSON("返信", "2026-10-01T13:00:00Z"),
 		"api repos/o/r/pulls/11/reviews --paginate": `[
 			{"id":100,"user":{"login":"alice"},"submitted_at":"2026-10-01T11:00:00Z"},
 			{"id":101,"user":{"login":"me"},"submitted_at":"2026-10-01T12:00:00Z"},
@@ -1083,5 +1085,318 @@ func TestCollectDedupReply(t *testing.T) {
 	}
 	if got[0].Pending != 1 {
 		t.Errorf("Pending = %d, want 1", got[0].Pending)
+	}
+}
+
+// TestCollectURL は、gh pr view の url が Summary.URL に入ることを確認する。
+// TUI でブラウザを開くときに使う値なので、取りこぼすと Enter が効かなくなる。
+func TestCollectURL(t *testing.T) {
+	const viewFields = "title,reviewDecision,updatedAt,commits,comments,url"
+	runner := fakeRunner(map[string]string{
+		"pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt": `[{"number":5,"updatedAt":"2026-10-01T00:00:00Z"}]`,
+		"pr view 5 --repo o/r --json " + viewFields:                                        `{"title":"t","reviewDecision":"","updatedAt":"2026-10-01T00:00:00Z","commits":[],"comments":[],"url":"https://github.com/o/r/pull/5"}`,
+		"api repos/o/r/pulls/5/reviews --paginate":                                         `[]`,
+		"api repos/o/r/pulls/5/comments --paginate":                                        `[]`,
+	})
+
+	got, err := Collect(runner, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("PR 件数 = %d, want 1", len(got))
+	}
+	if want := "https://github.com/o/r/pull/5"; got[0].URL != want {
+		t.Errorf("URL = %q, want %q", got[0].URL, want)
+	}
+}
+
+// TestOpenCommand は OS ごとのコマンド選択と、URL の検証を確認する。
+func TestOpenCommand(t *testing.T) {
+	const url = "https://github.com/o/r/pull/5"
+	tests := []struct {
+		name     string
+		goos     string
+		url      string
+		wantName string
+		wantArgs []string
+		wantErr  bool
+	}{
+		{"macOs", "darwin", url, "open", []string{url}, false},
+		{"Linux", "linux", url, "xdg-open", []string{url}, false},
+		{"windows", "windows", url, "rundll32", []string{"url.dll,FileProtocolHandler", url}, false},
+		{"未対応OS", "plan9", url, "", nil, true},
+		{"http も許可", "darwin", "http://ghe.example.com/o/r/pull/1", "open", []string{"http://ghe.example.com/o/r/pull/1"}, false},
+		{"空のURL", "darwin", "", "", nil, true},
+		// ファイルや独自スキームを OS に渡さないための検証
+		{"http(s)以外は拒否", "darwin", "file:///etc/passwd", "", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, args, err := openCommand(tt.goos, tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("openCommand() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if name != tt.wantName || !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("got (%q, %v), want (%q, %v)", name, args, tt.wantName, tt.wantArgs)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------
+// TUI
+// ---------------------------------------------------------------
+
+// tuiFixture は 3 件の PR を持つモデルと、開いた URL を記録する Opener を返す。
+func tuiFixture(openErr error) (tuiModel, *[]string) {
+	var opened []string
+	open := func(url string) error {
+		opened = append(opened, url)
+		return openErr
+	}
+	items := []Summary{
+		{Repo: "o/r", Number: 1, Title: "一つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/1", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+		{Repo: "o/r", Number: 2, Title: "二つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/2", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+		{Repo: "o/r", Number: 3, Title: "三つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/3", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+	}
+	return newTuiModel(items, open, NewPainter(false)), &opened
+}
+
+// press はキー入力を Update に渡して、更新後のモデルとコマンドを返す。
+func press(t *testing.T, m tuiModel, msg tea.KeyMsg) (tuiModel, tea.Cmd) {
+	t.Helper()
+	next, cmd := m.Update(msg)
+	got, ok := next.(tuiModel)
+	if !ok {
+		t.Fatalf("Update() の戻り値が tuiModel ではありません: %T", next)
+	}
+	return got, cmd
+}
+
+func runeKey(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+
+// カーソル移動(矢印キーと j/k)と、先頭・末尾での止まり方を確認する。
+func TestTuiMove(t *testing.T) {
+	m, _ := tuiFixture(nil)
+
+	steps := []struct {
+		name string
+		key  tea.KeyMsg
+		want int
+	}{
+		{"先頭で上へ(動かない)", tea.KeyMsg{Type: tea.KeyUp}, 0},
+		{"下へ", tea.KeyMsg{Type: tea.KeyDown}, 1},
+		{"j で下へ", runeKey('j'), 2},
+		{"末尾で下へ(動かない)", tea.KeyMsg{Type: tea.KeyDown}, 2},
+		{"k で上へ", runeKey('k'), 1},
+	}
+	for _, s := range steps {
+		m, _ = press(t, m, s.key)
+		if m.cursor != s.want {
+			t.Fatalf("%s: cursor = %d, want %d", s.name, m.cursor, s.want)
+		}
+	}
+}
+
+// Enter で、カーソル位置の PR の URL を Opener に渡すことを確認する。
+func TestTuiEnterOpenSelected(t *testing.T) {
+	m, opened := tuiFixture(nil)
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m, cmd := press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if want := []string{"https://github.com/o/r/pull/2"}; !reflect.DeepEqual(*opened, want) {
+		t.Errorf("開いた URL = %v, want %v", *opened, want)
+	}
+	if cmd != nil {
+		t.Errorf("Enter で終了してはいけません(続けて別の PR を開けるようにする)")
+	}
+	if !strings.Contains(m.status, "https://github.com/o/r/pull/2") {
+		t.Errorf("status に開いた URL が出ていません: %q", m.status)
+	}
+}
+
+// Opener が失敗しても TUI は落ちず、status にエラーが出ることを確認する。
+func TestTuiEnterOpenError(t *testing.T) {
+	m, _ := tuiFixture(errors.New("boom"))
+	m, cmd := press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("失敗しても終了してはいけません")
+	}
+	if !strings.Contains(m.status, "失敗") || !strings.Contains(m.status, "boom") {
+		t.Errorf("status にエラー内容が出ていません: %q", m.status)
+	}
+}
+
+// URL が空の PR では Opener を呼ばず、status で知らせることを確認する。
+func TestTuiEnterEmptyURL(t *testing.T) {
+	var called bool
+	m := newTuiModel([]Summary{{Repo: "o/r", Number: 1}}, func(string) error { called = true; return nil }, NewPainter(false))
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if called {
+		t.Errorf("URL が空なのに Opener が呼ばれました")
+	}
+	if !strings.Contains(m.status, "URL") {
+		t.Errorf("status に理由が出ていません: %q", m.status)
+	}
+}
+
+// 空リストでも Enter / 移動でパニックしないことを確認する。
+func TestTuiEmpty(t *testing.T) {
+	m := newTuiModel(nil, func(string) error { t.Fatal("呼ばれてはいけません"); return nil }, NewPainter(false))
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyDown}, {Type: tea.KeyUp}, {Type: tea.KeyEnter}} {
+		m, _ = press(t, m, k)
+	}
+	_ = m.View()
+}
+
+// q / Esc / Ctrl+C で終了コマンド(tea.Quit)が返ることを確認する。
+func TestTuiQuit(t *testing.T) {
+	keys := map[string]tea.KeyMsg{
+		"q":      runeKey('q'),
+		"esc":    {Type: tea.KeyEsc},
+		"ctrl+c": {Type: tea.KeyCtrlC},
+	}
+	for name, k := range keys {
+		t.Run(name, func(t *testing.T) {
+			m, _ := tuiFixture(nil)
+			_, cmd := press(t, m, k)
+			if cmd == nil {
+				t.Fatalf("終了コマンドが返りません")
+			}
+			if _, ok := cmd().(tea.QuitMsg); !ok {
+				t.Errorf("cmd() が tea.QuitMsg ではありません")
+			}
+		})
+	}
+}
+
+// View に、カーソル行の印・ヘッダ・各 PR・操作説明が含まれることを確認する。
+func TestTuiView(t *testing.T) {
+	m, _ := tuiFixture(nil)
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	v := m.View()
+
+	lines := strings.Split(v, "\n")
+	var marked []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "> ") {
+			marked = append(marked, l)
+		}
+	}
+	if len(marked) != 1 || !strings.Contains(marked[0], "二つ目") {
+		t.Errorf("「> 」が付くのはカーソル行(二つ目)だけのはずです: %v", marked)
+	}
+	for _, want := range []string{"リポジトリ", "一つ目", "三つ目", "Enter"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View に %q が含まれていません:\n%s", want, v)
+		}
+	}
+}
+
+// visibleRange は、画面に収まらない件数のときカーソルを中心にした窓を返す。
+func TestVisibleRange(t *testing.T) {
+	tests := []struct {
+		name                    string
+		total, cursor, capacity int
+		wantStart, wantEnd      int
+	}{
+		{"全部収まる", 2, 0, 5, 0, 2},
+		{"高さ不明(0)なら全件", 10, 5, 0, 0, 10},
+		{"先頭", 10, 0, 3, 0, 3},
+		{"中ほど", 10, 5, 3, 4, 7},
+		{"末尾", 10, 9, 3, 7, 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, e := visibleRange(tt.total, tt.cursor, tt.capacity)
+			if s != tt.wantStart || e != tt.wantEnd {
+				t.Errorf("got (%d, %d), want (%d, %d)", s, e, tt.wantStart, tt.wantEnd)
+			}
+		})
+	}
+}
+
+// TestCanRunTUI は、TUI を起動してよい条件(入出力が両方とも端末)を確認する。
+func TestCanRunTUI(t *testing.T) {
+	cases := []struct {
+		name          string
+		inTTY, outTTY bool
+		want          bool
+	}{
+		{"両方端末", true, true, true},
+		{"stdin がパイプ", false, true, false},
+		{"stdout がリダイレクト", true, false, false},
+		{"両方パイプ", false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := canRunTUI(c.inTTY, c.outTTY); got != c.want {
+				t.Errorf("canRunTUI(%v, %v) = %v, want %v", c.inTTY, c.outTTY, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTuiModelUpdate_WindowSize は、端末の「高さ」が height に入ることを確認する。
+func TestTuiModelUpdate_WindowSize(t *testing.T) {
+	m := newTuiModel(nil, nil, NewPainter(false))
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	if got := next.(tuiModel).height; got != 30 {
+		t.Errorf("height = %d, want 30(Width を誤って使っていないか確認)", got)
+	}
+}
+
+// TestTuiView_FitsHeight は、一覧が長くても View の行数が端末の高さに収まることを確認する。
+func TestTuiView_FitsHeight(t *testing.T) {
+	items := make([]Summary, 30)
+	for i := range items {
+		items[i] = Summary{Repo: "o/r", Number: i + 1, Title: "t", ReviewDecision: "NONE", UpdatedAt: time.Now()}
+	}
+	m := newTuiModel(items, nil, NewPainter(false))
+	m.height = 24
+	m.cursor = 15
+	got := strings.Count(m.View(), "\n")
+	if got > m.height {
+		t.Errorf("View() = %d 行, 端末の高さ %d を超えています", got, m.height)
+	}
+}
+
+// TestTuiMove_ClearsStatus は、カーソルが動いたら前回の操作結果を消すことを確認する。
+func TestTuiMove_ClearsStatus(t *testing.T) {
+	m, _ := tuiFixture(nil)
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.status == "" {
+		t.Fatal("Enter 後に status が空です")
+	}
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.status != "" {
+		t.Errorf("カーソル移動後も status が残っています: %q", m.status)
+	}
+}
+
+// TestTuiCapacity は、端末の高さから表の本体に使える行数を決める規則を確認する。
+func TestTuiCapacity(t *testing.T) {
+	tests := []struct {
+		name   string
+		height int
+		want   int
+	}{
+		{"高さ不明(0)は 0 = 全件", 0, 0},
+		{"十分な高さ", 24, 24 - tuiChromeLines},
+		{"小さい高さでも最低 1 行", 2, 1},
+		{"ちょうど chrome と同じ高さでも最低 1 行", tuiChromeLines, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tuiCapacity(tt.height); got != tt.want {
+				t.Errorf("tuiCapacity(%d) = %d, want %d", tt.height, got, tt.want)
+			}
+		})
 	}
 }

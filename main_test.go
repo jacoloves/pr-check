@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -1107,5 +1108,113 @@ func TestCollectURL(t *testing.T) {
 	}
 	if want := "https://github.com/o/r/pull/5"; got[0].URL != want {
 		t.Errorf("URL = %q, want %q", got[0].URL, want)
+	}
+}
+
+// TestOpenCommand は OS ごとのコマンド選択と、URL の検証を確認する。
+func TestOpenCommand(t *testing.T) {
+	const url = "https://github.com/o/r/pull/5"
+	tests := []struct {
+		name     string
+		goos     string
+		url      string
+		wantName string
+		wantArgs []string
+		wantErr  bool
+	}{
+		{"macOs", "darwin", url, "open", []string{url}, false},
+		{"Linux", "linux", url, "xdg-open", []string{url}, false},
+		{"windows", "windows", url, "rundll32", []string{"url.dll,FileProtocolHandler", url}, false},
+		{"未対応OS", "plan9", url, "", nil, true},
+		{"http も許可", "darwin", "http://ghe.example.com/o/r/pull/1", "open", []string{"http://ghe.example.com/o/r/pull/1"}, false},
+		{"空のURL", "darwin", "", "", nil, true},
+		// ファイルや独自スキームを OS に渡さないための検証
+		{"http(s)以外は拒否", "darwin", "file:///etc/passwd", "", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, args, err := openCommand(tt.goos, tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("openCommand() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if name != tt.wantName || !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("got (%q, %v), want (%q, %v)", name, args, tt.wantName, tt.wantArgs)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------
+// TUI
+// ---------------------------------------------------------------
+
+// tuiFixture は 3 件の PR を持つモデルと、開いた URL を記録する Opener を返す。
+func tuiFixture(openErr error) (tuiModel, *[]string) {
+	var opened []string
+	open := func(url string) error {
+		opened = append(opened, url)
+		return openErr
+	}
+	times := []Summary{
+		{Repo: "o/r", Number: 1, Title: "一つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/1", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+		{Repo: "o/r", Number: 2, Title: "二つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/2", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+		{Repo: "o/r", Number: 3, Title: "三つ目", ReviewDecision: "NONE", URL: "https://github.com/o/r/pull/3", UpdatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)},
+	}
+	return newTuiModel(items, open, NewPainter(false)), &opened
+}
+
+// press はキー入力を Update に渡して、更新後のモデルとコマンドを返す。
+func press(t *testing.T, m tuiModel, msg tea.KeyMsg) (tuiModeul, tea.Cmd) {
+	t.Helper()
+	next, cmd := m.Update(msg)
+	got, ok := next.(tuiModel)
+	if !ok {
+		t.Fatalf("Update() の戻り値が tuiModel ではありません: %T", next)
+	}
+	return got, cmd
+}
+
+func runeKey(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+
+// カーソル移動(矢印キーと j/k)と、先頭・末尾での止まり方を確認する。
+func TestTuiMove(t *testing.T) {
+	m, _ := tuiFixture(nil)
+
+	steps := []struct {
+		name string
+		key  tes.KeyMsg
+		want int
+	}{
+		{"先頭で上へ(動かない)", tea.KeyMsg{Type: tea.KeyUp}, 0},
+		{"下へ", tea.KeyMsg{Type: tea.KeyDown}, 1},
+		{"j で下へ", runeKey('j'), 2},
+		{"末尾で下へ(動かない)", tea.KeyMsg{Type: tea.KeyDown}, 2},
+		{"k で上へ", runeKey('k'), 1},
+	}
+	for _, s := range steps {
+		m, _ = press(t, m, s.key)
+		if m.cursor != s.want {
+			t.Fatalf("%s: cursor = %d, want %d", s.name, m.cursor, s.want)
+		}
+	}
+}
+
+// Enter で、カーソル位置の PR の URL を Opener に渡すことを確認する。
+func TestTuiEnterOpenSelected(t *testing.T) {
+	m, opend := tuiFixture(nil)
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m, cmd := press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if want := []string{"https://github.com/o/r/pull/2"}; !reflect.DeepEqual(*opened, want) {
+		t.Errorf("開いた URL = %v, want %v", *opend, want)
+	}
+	if cmd != nil {
+		t.Errorf("Enter で終了してはいけません(続けて別の PR を開けるようにする)")
+	}
+	if !strings.Contains(m.status, "https://github.com/o/r/pull/2") {
+		t.Errorf("status に開いた URL が出ていません: %q", m.status)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -530,6 +531,52 @@ func ShouldColor(mode string, getenv func(string) string, isTTY bool) (bool, err
 func isTerminal(f *os.File) bool {
 	info, err := f.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// ---------------------------------------------------------------
+// ブラウザ起動
+// ---------------------------------------------------------------
+
+// Opener は URL を既定のブラウザで開く関数。
+// テストでは偽物に差し替え、実際にブラウザが開かないようにする。
+type Opener func(url string) error
+
+// openCommand は goos 上で url を開くためのコマンド名と引数を返す。
+// OS コマンドを実際には実行しない純粋関数なので、テストしやすい。
+//
+// url は http:// か https:// のものだけを許可する。
+// (Windows の FileProtocolHandler などは、ファイルや独自スキームも開けてしまうため)
+func openCommand(goos, url string) (string, []string, error) {
+	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+		return "", nil, fmt.Errorf(
+			"開けない URL です: %q (http:// か https:// で始まる必要があります。gh pr view の url が空でないか確認してください)", url)
+	}
+	switch goos {
+	case "darwin":
+		return "open", []string{url}, nil
+	case "linux":
+		return "xdg-open", []string{url}, nil
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}, nil
+	default:
+		return "", nil, fmt.Errorf(
+			"この OS (%s) ではブラウザを自動で開けません。次の URL を手動で開いてください: %s", goos, url)
+	}
+}
+
+// openBrowser は Opener の既定実装。OS のコマンドで url を開く。
+// シェルは経由せず、url は引数としてそのまま渡す(コマンドインジェクションを避ける)。
+func openBrowser(url string) error {
+	name, args, err := openCommand(runtime.GOOS, url)
+	if err != nil {
+		return err
+	}
+	// Start だけ行い、ブラウザの終了は待たない。
+	if err := exec.Command(name, args...).Start(); err != nil {
+		return fmt.Errorf(
+			"ブラウザの起動に失敗しました (%s): %w (%s コマンドが使えるか確認してください)", url, err, name)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------

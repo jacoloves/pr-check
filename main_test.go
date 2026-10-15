@@ -1218,3 +1218,46 @@ func TestTuiEnterOpenSelected(t *testing.T) {
 		t.Errorf("status に開いた URL が出ていません: %q", m.status)
 	}
 }
+
+// Opener が失敗しても TUI は落ちず、status にエラーが出ることを確認する。
+func TestTuiEnterOpenError(t *testing.T) {
+	m, _ := tuiFixture(errors.New("boom"))
+	m, cmd := press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("失敗しても終了してはいけません")
+	}
+	if !strings.Contains(m.status, "失敗") || !strings.Contains(m.status, "boom") {
+		t.Errorf("status にエラー内容が出ていません: %q", m.status)
+	}
+}
+
+// URL が空の PR では Opener を呼ばず、status で知らせることを確認する。
+func TestTuiEnterEmptyURL(t *testing.T) {
+	var called bool
+	m := newTuiModel([]Summary{{Repo: "o/r", Number: 1}}, func(string) error { called = true; return nil }, NewPainter(false))
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if called {
+		t.Errorf("URL が空なのに Opener が呼ばれました")
+	}
+	if !strings.Contains(m.status, "URL") {
+		t.Errorf("status に理由が出ていません: %q", m.status)
+	}
+}
+
+// 空リストでも Enter / 移動でパニックしないことを確認する。
+func TestTuiEmpty(t *testing.T) {
+	m := newTuiModel(nil, func(string) error { t.Fatal("呼ばれてはいけません"); return nil }, NewPainter(false))
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyDown}, {Type: tea.KeyUp}, {Type: tea.KeyEnter}} {
+		m, _ = press(t, m, k)
+	}
+	_ = m.View()
+}
+
+// q / Esc / Ctrl+C で終了コマンド(tea.Quit)が返ることを確認する。
+func TestTuiQuit(t *testing.T) {
+	keys := map[string]tea.KeyMsg{
+		"q": runeKey('q'),
+	}
+}

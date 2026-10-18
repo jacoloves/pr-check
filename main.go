@@ -14,11 +14,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 	"gopkg.in/yaml.v3"
 )
@@ -216,6 +218,7 @@ type prView struct {
 	Title          string    `json:"title"`
 	ReviewDecision string    `json:"reviewDecision"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+	URL            string    `json:"url"`
 	Commits        []struct {
 		CommittedDate time.Time `json:"committedDate"`
 	} `json:"commits"`
@@ -366,6 +369,7 @@ type Summary struct {
 	ReviewDecision string
 	Pending        int
 	UpdatedAt      time.Time
+	URL            string
 }
 
 // Collect は1つのリポジトリについて、cfg.Author のオープンPRを列挙し、
@@ -400,7 +404,7 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		}
 		num := fmt.Sprint(p.Number)
 
-		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments")
+		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments,url")
 		if err != nil {
 			return nil, err
 		}
@@ -464,6 +468,7 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 			ReviewDecision: decision,
 			Pending:        CountPending(events, self),
 			UpdatedAt:      v.UpdatedAt,
+			URL:            v.URL,
 		})
 	}
 	return result, nil
@@ -527,6 +532,62 @@ func ShouldColor(mode string, getenv func(string) string, isTTY bool) (bool, err
 func isTerminal(f *os.File) bool {
 	info, err := f.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// canRunTUI は TUI を起動してよいかを返す。
+// bubbletea はキー入力を stdin から読み、画面を stdout に書くため、両方が端末でなければ動かない。
+func canRunTUI(inTTY, outTTY bool) bool {
+	return inTTY && outTTY
+}
+
+// ---------------------------------------------------------------
+// ブラウザ起動
+// ---------------------------------------------------------------
+
+// Opener は URL を既定のブラウザで開く関数。
+// テストでは偽物に差し替え、実際にブラウザが開かないようにする。
+type Opener func(url string) error
+
+// openCommand は goos 上で url を開くためのコマンド名と引数を返す。
+// OS コマンドを実際には実行しない純粋関数なので、テストしやすい。
+//
+// url は http:// か https:// のものだけを許可する。
+// (Windows の FileProtocolHandler などは、ファイルや独自スキームも開けてしまうため)
+func openCommand(goos, url string) (string, []string, error) {
+	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+		return "", nil, fmt.Errorf(
+			"開けない URL です: %q (http:// か https:// で始まる必要があります。gh pr view の url が空でないか確認してください)", url)
+	}
+	switch goos {
+	case "darwin":
+		return "open", []string{url}, nil
+	case "linux":
+		return "xdg-open", []string{url}, nil
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}, nil
+	default:
+		return "", nil, fmt.Errorf(
+			"この OS (%s) ではブラウザを自動で開けません。次の URL を手動で開いてください: %s", goos, url)
+	}
+}
+
+// openBrowser は Opener の既定実装。OS のコマンドで url を開く。
+// シェルは経由せず、url は引数としてそのまま渡す(コマンドインジェクションを避ける)。
+func openBrowser(url string) error {
+	name, args, err := openCommand(runtime.GOOS, url)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(name, args...)
+	// Start だけ行い、ブラウザの終了は待たない。
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf(
+			"ブラウザの起動に失敗しました (%s): %w (%s コマンドが使えるか確認してください)", url, err, name)
+	}
+	// 終了した子プロセス(ゾンビ)を OS に回収させるため、別 goroutine で Wait する。
+	// UI を止めないよう、結果は待たず捨てる。
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 // ---------------------------------------------------------------
@@ -779,7 +840,13 @@ func run() error {
 	reverseFlag := flag.Bool("reverse", false, "並び順を反転する(--sort と併用)")
 	colorFlag := flag.String("color", "auto", "色付け: auto(端末のときだけ) / always / never。auto では NO_COLOR 環境変数も尊重する")
 	sinceFlag := flag.String("since", "", "この期間内に更新されたPRだけ表示: 7d / 2w / 36h / 90m / 2026-10-01(日付)。省略時は全件")
+	tuiFlag := flag.Bool("tui", false, "PR を TUI で選び、Enter でブラウザで開く(端末でのみ使用可)")
 	flag.Parse()
+
+	// bubbletea はキー入力を stdin から、画面を stdout に出すため、両方が端末である必要がある。
+	if *tuiFlag && !canRunTUI(isTerminal(os.Stdin), isTerminal(os.Stdout)) {
+		return fmt.Errorf("--tui は端末でのみ使えます(標準入出力がパイプやリダイレクトになっています)。--tui を外すと表で出力します")
+	}
 
 	// 引数の誤りは、時間のかかる gh の呼び出しの前に検出する。
 	sortKey, err := ParseSortKey(*sortFlag)
@@ -843,5 +910,138 @@ func run() error {
 		all = append(all, summaries...)
 	}
 	SortSummaries(all, sortKey, *reverseFlag)
+
+	// 0 件のときは TUI を起動せず、従来どおり表(ヘッダのみ)を出す。
+	if *tuiFlag && len(all) > 0 {
+		prog := tea.NewProgram(newTuiModel(all, openBrowser, NewPainter(useColor)), tea.WithAltScreen())
+		if _, err := prog.Run(); err != nil {
+			return fmt.Errorf("TUI の実行に失敗しました: %w (端末の状態を確認し、--tui なしで実行して表示だけ確認することもできます)", err)
+		}
+		return nil
+	}
 	return Render(os.Stdout, all, NewPainter(useColor))
+}
+
+// ---------------------------------------------------------------
+// TUI(PR を選んでブラウザで開く)
+// ---------------------------------------------------------------
+
+// tuiModel は bubbletea のモデル。表示中の PR 一覧とカーソル位置を持つ。
+type tuiModel struct {
+	items   []Summary // 表示する PR(ソート済み)
+	cursor  int       // 選択中の行(items の添字)
+	height  int       // 端末の高さ(0 = 未取得。そのときは全件表示)
+	open    Opener    // Enter で呼ぶ。テストでは偽物に差し替える
+	painter Painter   // Render に渡す色付け
+	status  string    // 最後の操作結果(開いた URL / エラー)
+}
+
+// newTuiModel は初期状態のモデルを作る。
+func newTuiModel(items []Summary, open Opener, p Painter) tuiModel {
+	return tuiModel{items: items, open: open, painter: p}
+}
+
+// Init は起動時の処理。今回は何もしない。
+func (m tuiModel) Init() tea.Cmd { return nil }
+
+// Update はメッセージ(キー入力・画面サイズ変更)を受けて状態を更新する。
+func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "esc", "ctrl+c":
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.status = ""
+			}
+		case "down", "j":
+			if m.cursor < len(m.items)-1 {
+				m.cursor++
+				m.status = ""
+			}
+		case "enter":
+			m.openSelected()
+		}
+	}
+	return m, nil
+}
+
+// openSelected は選択中の PR をブラウザで開き、結果を status に残す。
+func (m *tuiModel) openSelected() {
+	if len(m.items) == 0 {
+		return
+	}
+	s := m.items[m.cursor]
+	if s.URL == "" {
+		m.status = fmt.Sprintf("%s #%d の URL が取得できていません", s.Repo, s.Number)
+		return
+	}
+	if err := m.open(s.URL); err != nil {
+		m.status = fmt.Sprintf("開くのに失敗しました: %v", err)
+		return
+	}
+	m.status = "開きました: " + s.URL
+}
+
+// tuiChromeLines は表以外に使う行数(ヘッダ 1 + 空行 1 + 操作説明 1 + status 1)。
+const tuiChromeLines = 4
+
+// tuiCapacity は、端末の高さ height から、表の本体に使える行数を返す。
+// height == 0 は「まだ取得できていない」ことを表し、0 を返す(visibleRange は全件を表示する)。
+// 高さが小さくても最低 1 行は確保し、カーソルの行が必ず画面に入るようにする。
+func tuiCapacity(height int) int {
+	if height <= 0 {
+		return 0
+	}
+	if c := height - tuiChromeLines; c > 1 {
+		return c
+	}
+	return 1
+}
+
+// View は現在の状態を文字列にする。
+// 表は既存の Render をそのまま使い、行頭に 2 文字ぶんの印を付ける。
+func (m tuiModel) View() string {
+	var buf bytes.Buffer
+	// bytes.Buffer への書き込みは失敗しないので、エラーは無視してよい。
+	_ = Render(&buf, m.items, m.painter)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	header, body := lines[0], lines[1:]
+
+	start, end := visibleRange(len(body), m.cursor, tuiCapacity(m.height))
+
+	var b strings.Builder
+	b.WriteString(" " + header + "\n")
+	for i := start; i < end; i++ {
+		if i == m.cursor {
+			b.WriteString("> ")
+		} else {
+			b.WriteString("  ")
+		}
+		b.WriteString(body[i] + "\n")
+	}
+	b.WriteString("\n  ↑/k ↓/j: 移動   Enter: ブラウザで開く   q/Esc: 終了\n")
+	b.WriteString("  " + m.status + "\n")
+	return b.String()
+}
+
+// visibleRange は、total 行のうち capacity 行しか表示できないとき、
+// cursor が見える範囲 [start, end) を返す。cursor をなるべく中央に置く。
+// capacity <= 0(高さ不明)や全部収まる場合は全件を返す。
+func visibleRange(total, cursor, capacity int) (start, end int) {
+	if capacity <= 0 || total <= capacity {
+		return 0, total
+	}
+	start = cursor - capacity/2
+	if start < 0 {
+		start = 0
+	}
+	if start+capacity > total {
+		start = total - capacity
+	}
+	return start, start + capacity
 }

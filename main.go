@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -361,6 +362,27 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 // 対象は「自分が作成したオープンな PR」なので、200 件あれば実用上十分と判断している。
 const prListLimit = 200
 
+// maxConcurrentGh は同時に実行する gh プロセス数の上限。
+// 多すぎると GitHub の二次レート制限(短時間の大量リクエスト)に当たりやすくなる。
+const maxConcurrentGh = 8
+
+// limitRunner は run を、同時実行数が n 以下になるように包んだ Runner を返す。
+//
+// バッファ付き channel をセマフォとして使う。
+//   - 実行前に channel へ送信 → 満杯なら空くまでブロックする(=枠を取る)
+//   - 実行後に channel から受信 → 枠を返す
+//
+// 枠を持つのは run を呼んでいる間だけなので、呼び出し元が子の完了を待つ構造でも
+// デッドロックしない。
+func limitRunner(run Runner, n int) Runner {
+	sem := make(chan struct{}, n)
+	return func(args ...string) ([]byte, error) {
+		sem <- struct{}{}
+		defer func() { <-sem }()
+		return run(args...)
+	}
+}
+
 // Summary は1PR分の表示内容。
 type Summary struct {
 	Repo           string
@@ -376,6 +398,9 @@ type Summary struct {
 // それぞれの要約を作る。self は「自分の行動」とみなす作成者のログイン名
 // ("@me" 解決済みの値)。
 func Collect(run Runner, repo string, cfg *Config, self string, since time.Time) ([]Summary, error) {
+	// gh の同時実行数を maxConcurrentGh 以下に抑える。
+	run = limitRunner(run, maxConcurrentGh)
+
 	// 除外ユーザーを高速に引けるよう集合にする。
 	exclude := make(map[string]bool, len(cfg.ExcludeUsers))
 	for _, u := range cfg.ExcludeUsers {
@@ -395,83 +420,150 @@ func Collect(run Runner, repo string, cfg *Config, self string, since time.Time)
 		return nil, fmt.Errorf("%s のPR一覧のパースに失敗しました: %w", repo, err)
 	}
 
-	var result []Summary
+	// --since より古い PR は、詳細取得(gh を 3 回呼ぶ)をする前に除外する。
+	// since がゼロ値のときは絞り込まない。境界ちょうどは含める。
+	var targets []int
 	for _, p := range list {
-		// --since より古い PR は、詳細取得(gh を 2 回呼ぶ)をする前に除外する。
-		// since がゼロ値のときは絞り込まない。境界ちょうどは含める。
 		if !since.IsZero() && p.UpdatedAt.Before(since) {
 			continue
 		}
-		num := fmt.Sprint(p.Number)
+		targets = append(targets, p.Number)
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
 
-		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments,url")
-		if err != nil {
-			return nil, err
-		}
-		var v prView
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, fmt.Errorf("%s の PR #%s の詳細のパースに失敗しました: %w", repo, num, err)
-		}
+	// 結果は PR の並び順どおりに入れたいので、添字ごとのスロットに書き込む。
+	// 各 goroutine は自分の添字のスロットにしか書かないため、ロックは不要。
+	results := make([]Summary, len(targets))
+	errs := make([]error, len(targets))
 
-		// レビューは REST から取得する(行コメントとの紐づけに数値 ID が必要なため)。
-		rawReviews, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/reviews", repo, num), "--paginate")
-		if err != nil {
-			return nil, err
-		}
-		reviews, err := decodeAll[restReview](rawReviews)
-		if err != nil {
-			return nil, err
-		}
-
-		rawInline, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/comments", repo, num), "--paginate")
-		if err != nil {
-			return nil, err
-		}
-		inline, err := decodeAll[inlineComment](rawInline)
-		if err != nil {
-			return nil, err
-		}
-
-		inline = dropAbsorbedInline(inline, reviews)
-
-		// 取得元ごとの違いを Event に正規化する。
-		// 他者のうち exclude_users に含まれるユーザーの行動は追加しない。
-		var events []Event
-		add := func(at time.Time, who string) {
-			if who != self && exclude[who] {
+	var wg sync.WaitGroup
+	for i, number := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := fetchDetail(run, repo, number)
+			if err != nil {
+				errs[i] = err
 				return
 			}
-			events = append(events, Event{at, who})
-		}
-		// コミットは PR 作成者(=self)の行動として扱う。
-		for _, c := range v.Commits {
-			add(c.CommittedDate, self)
-		}
-		for _, r := range reviews {
-			add(r.SubmittedAt, r.User.Login)
-		}
-		for _, c := range v.Comments {
-			add(c.CreatedAt, c.Author.Login)
-		}
-		for _, c := range inline {
-			add(c.CreatedAt, c.User.Login)
-		}
-
-		decision := v.ReviewDecision
-		if decision == "" {
-			decision = "NONE"
-		}
-		result = append(result, Summary{
-			Repo:           repo,
-			Number:         p.Number,
-			Title:          v.Title,
-			ReviewDecision: decision,
-			Pending:        CountPending(events, self),
-			UpdatedAt:      v.UpdatedAt,
-			URL:            v.URL,
-		})
+			results[i] = summarize(repo, number, d, exclude, self)
+		}()
 	}
-	return result, nil
+	wg.Wait()
+
+	// 並び順で最初のエラーを返す(毎回同じ結果になる)。
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
+// prDetail は 1 PR について gh から取得した生データ。
+type prDetail struct {
+	view    prView
+	reviews []restReview
+	inline  []inlineComment
+}
+
+// fetchDetail は 1 PR の詳細・レビュー・行コメントを取得する。
+// 3 つの呼び出しは互いに独立なので、同時に実行する。
+// 各 goroutine は別々の変数にだけ書き込むため、ロックは不要。
+func fetchDetail(run Runner, repo string, number int) (prDetail, error) {
+	num := strconv.Itoa(number)
+	var d prDetail
+	var errs [3]error // errs[0]: view, errs[1]: reviews, errs[2]: inline
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		raw, err := run("pr", "view", num, "--repo", repo, "--json", "title,reviewDecision,updatedAt,commits,comments,url")
+		if err != nil {
+			errs[0] = err
+			return
+		}
+		if err := json.Unmarshal(raw, &d.view); err != nil {
+			errs[0] = fmt.Errorf("%s の PR #%s の詳細のパースに失敗しました: %w", repo, num, err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		// レビューは REST から取得する(行コメントとの紐づけに数値 ID が必要なため)。
+		raw, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/reviews", repo, num), "--paginate")
+		if err != nil {
+			errs[1] = err
+			return
+		}
+		d.reviews, errs[1] = decodeAll[restReview](raw)
+	}()
+
+	go func() {
+		defer wg.Done()
+		raw, err := run("api", fmt.Sprintf("repos/%s/pulls/%s/comments", repo, num), "--paginate")
+		if err != nil {
+			errs[2] = err
+			return
+		}
+		d.inline, errs[2] = decodeAll[inlineComment](raw)
+	}()
+
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return prDetail{}, err
+		}
+	}
+	return d, nil
+}
+
+// summarize は取得済みの生データから Summary を作る。通信はしない。
+// exclude は除外ユーザーの集合、self は「自分の行動」とみなすログイン名。
+func summarize(repo string, number int, d prDetail, exclude map[string]bool, self string) Summary {
+	inline := dropAbsorbedInline(d.inline, d.reviews)
+
+	// 取得元ごとの違いを Event に正規化する。
+	// 他者のうち exclude_users に含まれるユーザーの行動は追加しない。
+	var events []Event
+	add := func(at time.Time, who string) {
+		if who != self && exclude[who] {
+			return
+		}
+		events = append(events, Event{at, who})
+	}
+	// コミットは PR 作成者(=self)の行動として扱う。
+	for _, c := range d.view.Commits {
+		add(c.CommittedDate, self)
+	}
+	for _, r := range d.reviews {
+		add(r.SubmittedAt, r.User.Login)
+	}
+	for _, c := range d.view.Comments {
+		add(c.CreatedAt, c.Author.Login)
+	}
+	for _, c := range inline {
+		add(c.CreatedAt, c.User.Login)
+	}
+
+	decision := d.view.ReviewDecision
+	if decision == "" {
+		decision = "NONE"
+	}
+	return Summary{
+		Repo:           repo,
+		Number:         number,
+		Title:          d.view.Title,
+		ReviewDecision: decision,
+		Pending:        CountPending(events, self),
+		UpdatedAt:      d.view.UpdatedAt,
+		URL:            d.view.URL,
+	}
 }
 
 // ---------------------------------------------------------------

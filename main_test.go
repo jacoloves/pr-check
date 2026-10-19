@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1398,5 +1401,147 @@ func TestTuiCapacity(t *testing.T) {
 				t.Errorf("tuiCapacity(%d) = %d, want %d", tt.height, got, tt.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------
+// 並列化
+// ---------------------------------------------------------------
+
+// concurrencyProbe は、同時に実行中の呼び出し数の最大値を記録する。
+type concurrencyProbe struct {
+	inflight atomic.Int32 // いま実行中の数
+	max      atomic.Int32 // これまでの最大値
+}
+
+// wrap は inner を、実行中カウント付き・d だけ待つ Runner に包む。
+// 待ち時間を入れることで、並列なら呼び出しが重なることを再現する。
+func (p *concurrencyProbe) wrap(inner Runner, d time.Duration) Runner {
+	return func(args ...string) ([]byte, error) {
+		cur := p.inflight.Add(1)
+		defer p.inflight.Add(-1)
+
+		// 最大値を更新する(他の goroutine と競合しても落とさないよう CAS で行う)。
+		for {
+			old := p.max.Load()
+			if cur <= old || p.max.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		time.Sleep(d)
+		return inner(args...)
+	}
+}
+
+// manyPRsRunner は o/r に PR #1〜#n があるときの gh の応答を返す偽 Runner。
+// 各 PR はタイトル "pr<番号>"、レビュー・コメントなし。
+func manyPRsRunner(n int) Runner {
+	responses := map[string]string{}
+	list := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		list = append(list, fmt.Sprintf(`{"number":%d,"updatedAt":"2026-10-01T00:00:00Z"}`, i))
+		responses[fmt.Sprintf("pr view %d --repo o/r --json title,reviewDecision,updatedAt,commits,comments,url", i)] =
+			fmt.Sprintf(`{"title":"pr%d","reviewDecision":"","updatedAt":"2026-10-01T00:00:00Z","commits":[],"comments":[],"url":"https://github.com/o/r/pull/%d"}`, i, i)
+		responses[fmt.Sprintf("api repos/o/r/pulls/%d/reviews --paginate", i)] = `[]`
+		responses[fmt.Sprintf("api repos/o/r/pulls/%d/comments --paginate", i)] = `[]`
+	}
+	responses["pr list --repo o/r --author @me --state open --limit 200 --json number,updatedAt"] = "[" + strings.Join(list, ",") + "]"
+	return fakeRunner(responses)
+}
+
+// TestLimitRunner は、limitRunner が同時実行数を上限以下に抑えることを確認する。
+func TestLimitRunner(t *testing.T) {
+	const limit = 2
+	var probe concurrencyProbe
+	inner := probe.wrap(func(args ...string) ([]byte, error) { return nil, nil }, 10*time.Microsecond)
+	run := limitRunner(inner, limit)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = run("x")
+		}()
+	}
+	wg.Wait()
+
+	if got := probe.max.Load(); got > limit {
+		t.Errorf("同時実行数の最大 = %d, 上限 %d を超えています", got, limit)
+	}
+	if got := probe.max.Load(); got < 1 {
+		t.Errorf("同時実行数の最大 = %d, 1 以上のはずです", got)
+	}
+}
+
+// TestCollectRunsConcurrently は、Collect が gh を並列に呼ぶこと(かつ上限内であること)を確認する。
+// 直列実装なら最大は 1 のままになる。
+func TestCollectRunsConcurrently(t *testing.T) {
+	var probe concurrencyProbe
+	run := probe.wrap(manyPRsRunner(6), 20*time.Millisecond)
+
+	got, err := Collect(run, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	if len(got) != 6 {
+		t.Fatalf("PR 件数 = %d, want 6", len(got))
+	}
+	if m := probe.max.Load(); m < 2 {
+		t.Errorf("同時実行数の最大 = %d, 並列なら 2 以上のはずです(直列のままになっていませんか)", m)
+	}
+	if m := probe.max.Load(); m > maxConcurrentGh {
+		t.Errorf("同時実行数の最大 = %d, 上限 %d を超えています", m, maxConcurrentGh)
+	}
+}
+
+// TestCollectKeepsOrder は、完了順が前後しても、結果が pr list の順に並ぶことを確認する。
+// PR の番号が小さいほど pr view を遅くして、完了順を逆転させている。
+func TestCollectKeepsOrder(t *testing.T) {
+	inner := manyPRsRunner(5)
+	run := func(args ...string) ([]byte, error) {
+		if len(args) >= 3 && args[0] == "pr" && args[1] == "view" {
+			n, _ := strconv.Atoi(args[2])
+			time.Sleep(time.Duration(6-n) * 15 * time.Millisecond)
+		}
+		return inner(args...)
+	}
+
+	got, err := Collect(run, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() が予期せず失敗しました: %v", err)
+	}
+	var titles []string
+	for _, s := range got {
+		titles = append(titles, s.Title)
+	}
+	want := []string{"pr1", "pr2", "pr3", "pr4", "pr5"}
+	if !reflect.DeepEqual(titles, want) {
+		t.Errorf("タイトルの順序 = %v, want %v", titles, want)
+	}
+}
+
+// TestCollectReturnsFirstErrorInOrder は、複数の PR で失敗しても、
+// 並び順で最初のエラーが毎回返ることを確認する。
+func TestCollectReturnsFirstErrorInOrder(t *testing.T) {
+	inner := manyPRsRunner(4)
+	run := func(args ...string) ([]byte, error) {
+		switch strings.Join(args, " ") {
+		case "api repos/o/r/pulls/3/comments --paginate":
+			return nil, errors.New("boom3")
+		case "pr view 2 --repo o/r --json title,reviewDecision,updatedAt,commits,comments,url":
+			// PR3 より遅く失敗させて、完了順では PR3 のエラーが先になるようにする。
+			time.Sleep(30 * time.Millisecond)
+			return nil, errors.New("boom2")
+		}
+		return inner(args...)
+	}
+
+	_, err := Collect(run, "o/r", &Config{Author: "@me"}, "me", time.Time{})
+	if err == nil {
+		t.Fatal("Collect() がエラーを返しませんでした")
+	}
+	if !strings.Contains(err.Error(), "boom2") {
+		t.Errorf("err = %v, 並び順で最初の PR #2 のエラー (boom2) のはずです", err)
 	}
 }
